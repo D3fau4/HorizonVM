@@ -11,6 +11,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import hvm_keys  # noqa: E402
 import hvm_log  # noqa: E402
+import hvm_nand  # noqa: E402
+import mknand   # noqa: E402
 import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
 import mkpkg2   # noqa: E402
@@ -277,6 +279,94 @@ class TestHvmKeys(unittest.TestCase):
         src += 'static_assert(ams::pkg1::OldDeviceMasterKeyCount == %d);\n' % hvm_keys.DEVICE_MASTER_KEY_COUNT
         r = compile_check(src)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+
+def xts_reference(key, data, unit):
+    """Textbook IEEE 1619 XTS from AES-ECB, with Nintendo's big-endian data unit number as the tweak."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    ecb = lambda k: Cipher(algorithms.AES(k), modes.ECB()).encryptor()
+    t = int.from_bytes(ecb(key[16:]).update(unit.to_bytes(16, 'big')), 'little')
+    out = b''
+    for i in range(0, len(data), 16):
+        tb = t.to_bytes(16, 'little')
+        x = bytes(a ^ b for a, b in zip(data[i:i + 16], tb))
+        out += bytes(a ^ b for a, b in zip(ecb(key[:16]).update(x), tb))
+        t = ((t << 1) ^ (0x87 if t >> 127 else 0)) & ((1 << 128) - 1)
+    return out
+
+
+TOOLS_AVAILABLE = all(shutil.which(t) for t in ('mkfs.fat', 'mcopy', 'fsck.fat', 'sgdisk'))
+
+
+class TestNand(unittest.TestCase):
+    def test_xts_matches_reference(self):
+        key = hashlib.sha256(b'k').digest()
+        data = hashlib.sha512(b'd').digest() * 512        # two XTS units
+        enc = hvm_nand.xts(key, data, 5, True)
+        self.assertEqual(enc[:0x4000], xts_reference(key, data[:0x4000], 5))
+        self.assertEqual(enc[0x4000:], xts_reference(key, data[0x4000:], 6))
+        self.assertEqual(hvm_nand.xts(key, enc, 5, False), data)
+
+    def test_layout(self):
+        parts = hvm_nand.PARTITIONS
+        for (_, o1, s1, *_), (_, o2, *_) in zip(parts, parts[1:]):
+            self.assertLessEqual(o1 + s1, o2)
+        self.assertEqual(parts[0][1], 34 * hvm_nand.LBA)                     # first usable LBA
+        end = parts[-1][1] + parts[-1][2]
+        self.assertLessEqual(end, hvm_nand.USER_AREA_SIZE - 33 * hvm_nand.LBA)   # room for the backup GPT
+        self.assertEqual({p[4] for p in parts if p[5]}, {0, 1, 2, 3})
+
+    def test_blank_cal0(self):
+        cal = hvm_nand.build_blank_cal0()
+        self.assertTrue(hvm_nand.check_cal0(cal))
+        for off, size in hvm_nand.CAL0_CRC_BLOCKS:
+            self.assertEqual(hvm_nand.crc16(cal[off:off + size - 2]), struct.unpack_from('<H', cal, off + size - 2)[0])
+        bad = bytearray(cal)
+        bad[0x300] ^= 1
+        self.assertFalse(hvm_nand.check_cal0(bytes(bad)))
+
+    @unittest.skipUnless(TOOLS_AVAILABLE, 'dosfstools/mtools/gdisk not available')
+    def test_image_roundtrip(self):
+        d = tempfile.mkdtemp()
+        old = hvm_nand.HVM
+        try:
+            hvm_nand.HVM = d
+            ident = os.path.join(d, 'identity', 'erista')
+            os.makedirs(ident)
+            with open(os.path.join(ident, 'bis.bin'), 'wb') as f:
+                f.write(hashlib.sha512(b'a').digest() + hashlib.sha512(b'b').digest())
+            with open(os.path.join(ident, 'ecid.json'), 'w') as f:
+                f.write('{"lot0": 1}')
+            tree = os.path.join(d, 'tree')
+            for sub in mknand.TREE_DIRS:
+                os.makedirs(os.path.join(tree, sub))
+            reg = os.path.join(tree, 'SYSTEM/Contents/registered')
+            for i in range(3):
+                with open(os.path.join(reg, '%032x.nca' % i), 'wb') as f:
+                    f.write(hashlib.sha512(bytes([i])).digest() * (0x900 * (i + 1)) + bytes(0x8000))
+            with open(os.path.join(tree, 'PRODINFO.bin'), 'wb') as f:
+                f.write(hvm_nand.build_blank_cal0())
+            img = os.path.join(d, 'emmc.img')
+            mknand.build_image('erista', tree, img)
+            self.assertEqual(os.path.getsize(img), hvm_nand.IMAGE_SIZE)
+            self.assertEqual(mknand.verify('erista', tree, img), [])
+
+            with open(os.path.join(reg, '%032x.nca' % 1), 'r+b') as f:   # tree changed after the build
+                f.write(b'X')
+            self.assertTrue(any('content differs' in p for p in mknand.verify('erista', tree, img)))
+            with open(os.path.join(ident, 'bis.bin'), 'r+b') as f:        # wrong keys: nothing decrypts
+                f.seek(64)
+                f.write(bytes(32))
+            problems = mknand.verify('erista', tree, img)
+            self.assertTrue(any(p.startswith('SYSTEM: fsck.fat') for p in problems), problems)
+            self.assertFalse(any(p.startswith('GPT') for p in problems))
+            with open(img, 'r+b') as f:                                   # corrupt the primary GPT header
+                f.seek(2 * hvm_nand.BOOT_PART_SIZE + hvm_nand.LBA + 40)
+                f.write(b'\xff')
+            self.assertTrue(any(p.startswith('GPT') for p in mknand.verify('erista', tree, img)))
+        finally:
+            hvm_nand.HVM = old
+            shutil.rmtree(d)
 
 
 def tipc(cmd, name=b'', pid=False):

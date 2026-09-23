@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
-# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--user-exc] [--gdb] [--trace] [-- extra qemu args]
+# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|none] [--persist] [--user-exc]
+#               [--gdb] [--trace] [-- extra qemu args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,6 +10,8 @@ OUT=nintendo_nx_arm64_armv8a/debug
 AMS="$ROOT/third_party/Atmosphere"
 SOC=erista
 INI=
+NAND=
+SNAPSHOT=on
 EXO0_ARGS=()
 GDB=()
 TRACE=()
@@ -18,6 +21,8 @@ while [ $# -gt 0 ]; do
         --soc) SOC="$2"; shift 2 ;;
         --ini) INI="$2"; shift 2 ;;
         --user-exc) EXO0_ARGS+=(--user-exc); shift ;;
+        --nand) NAND="$2"; shift 2 ;;
+        --persist) SNAPSHOT=off; shift ;;
         --gdb) GDB=(-s -S); shift ;;
         --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log"); shift ;;
         --) shift; break ;;
@@ -52,13 +57,23 @@ for f in "$ID"/aeskeyslot*.bin; do
 done
 
 EXTRA=()
+IMG="$HVM/nand/$SOC/emmc.img"
+[ -z "$NAND" ] && { [ -f "$IMG" ] && NAND=image || NAND=none; }
+case "$NAND" in
+    # SDMMC4 eMMC (tegrax1.c: sd index 3). snapshot=on keeps the image pristine; its overlay goes to $TMPDIR.
+    image) [ -f "$IMG" ] || { echo "missing $IMG (tools/mknand.py --soc $SOC --fw <FW> --image)" >&2; exit 1; }
+           EXTRA+=(-drive "if=sd,index=3,format=raw,file=$IMG,snapshot=$SNAPSHOT") ;;
+    none) ;;
+    *) echo "unknown nand backend: $NAND" >&2; exit 2 ;;
+esac
 if [ "$SOC" = mariko ]; then
     # exosphere copies the Mariko fatal program from 0x80020000 into TZRAM (secmon_boot_setup.cpp LoadMarikoProgram).
     EXTRA+=(-device "loader,addr=0x80020000,force-raw=on,file=$AMS/exosphere/mariko_fatal/out/$OUT/mariko_fatal.bin")
 fi
 
 umask 077
-mkdir -p "$HVM/logs" "$HVM/run"
+mkdir -p "$HVM/logs" "$HVM/run" "$HVM/tmp"
+export TMPDIR="$HVM/tmp"
 TRACE=("${TRACE[@]/SOC/$SOC}")
 python3 "$ROOT/tools/mkexo0.py" -o "$HVM/run/exo0-$SOC.bin" "${EXO0_ARGS[@]}"
 
