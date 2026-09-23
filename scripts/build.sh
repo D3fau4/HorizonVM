@@ -8,3 +8,6 @@ export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
 
 make -C "$AMS/mesosphere" nx_debug -j"$(nproc)"
 make -C "$AMS/exosphere" nx_debug -j"$(nproc)"
+
+mkdir -p "$ROOT/build"
+python3 "$ROOT/tools/mkpkg2.py" "$AMS/mesosphere/out/nintendo_nx_arm64_armv8a/debug/mesosphere.bin" -o "$ROOT/build/package2.bin"
