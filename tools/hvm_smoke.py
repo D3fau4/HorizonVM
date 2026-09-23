@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless boot smoke test: exosphere -> Mesosphere reaches Initialized with all cores idle."""
+"""Headless boot smoke test: exosphere -> Mesosphere (-> INI1 processes) reaches its expected state per SoC x INI1 profile."""
 import argparse
 import os
 import re
@@ -15,6 +15,7 @@ HVM = os.environ.get('HORIZONVM_HOME', os.path.expanduser('~/.horizonvm'))
 KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/nintendo_nx_arm64_armv8a/debug/kernel.elf')
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
+PROFILES = ('empty', 'core', 'ams', 'stock')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 
@@ -57,7 +58,7 @@ def monitor(sock_path, commands):
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
 
-def smoke(soc, timeout):
+def smoke(soc, ini, timeout):
     os.makedirs(os.path.join(HVM, 'run'), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(HVM, 'logs'), mode=0o700, exist_ok=True)
     sock = os.path.join(HVM, 'run', 'mon-%s.sock' % soc)
@@ -67,7 +68,7 @@ def smoke(soc, timeout):
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--trace', '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini, '--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
@@ -89,7 +90,7 @@ def smoke(soc, timeout):
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'qemu-%s.log' % soc))
     for v in trace['violations']:
-        print('%-7s trace: %s' % (soc, v))
+        print('%-7s %-5s trace: %s' % (soc, ini, v))
     return [
         ('exosphere OHAYO (single boot)', log.count('OHAYO') == 1),
         ('exosphere KeyGen 15', '[secmon] KeyGen: 15' in log),
@@ -105,15 +106,19 @@ def smoke(soc, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--soc', action='append', choices=['erista', 'mariko'])
+    ap.add_argument('--ini', help='comma-separated INI1 profiles (default: every built build/package2-<ini>.bin)')
     ap.add_argument('--timeout', type=int, default=60)
     args = ap.parse_args()
     os.umask(0o077)
 
+    inis = args.ini.split(',') if args.ini else [
+        i for i in PROFILES if os.path.exists(os.path.join(ROOT, 'build', 'package2-%s.bin' % i))]
     failed = False
-    for soc in args.soc or ['erista', 'mariko']:
-        for name, ok in smoke(soc, args.timeout):
-            print('%-7s %-6s %s' % (soc, 'PASS' if ok else 'FAIL', name))
-            failed |= not ok
+    for ini in inis:
+        for soc in args.soc or ['erista', 'mariko']:
+            for name, ok in smoke(soc, ini, args.timeout):
+                print('%-7s %-5s %-6s %s' % (soc, ini, 'PASS' if ok else 'FAIL', name))
+                failed |= not ok
     sys.exit(1 if failed else 0)
 
 

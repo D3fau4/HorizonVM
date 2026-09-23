@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import hvm_log  # noqa: E402
+import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
 import mkpkg2   # noqa: E402
 
@@ -16,6 +17,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 AMS = os.path.join(ROOT, 'third_party', 'Atmosphere')
 MESO = os.path.join(AMS, 'mesosphere/out/nintendo_nx_arm64_armv8a/debug/mesosphere.bin')
 GXX = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-g++')
+FW = os.environ.get('HVM_FW', '')
+FW_INI1 = os.path.join(FW, 'Processed/BootImagePackage/romfs/nx/package2.storage/INI1.bin')
+AMS_KIPS = [os.path.join(AMS, 'stratosphere/%s/out/nintendo_nx_arm64_armv8a/debug/%s.kip' % (m, m))
+            for m in ('sm', 'spl', 'pm', 'loader', 'ncm', 'boot')]
 
 
 def read(path):
@@ -30,11 +35,23 @@ def fake_meso(size=0x3000, meta_offset=0x800):
     return bytes(m)
 
 
-def fake_kip(program_id, size=0x200):
+def fake_kip(program_id, size=0x200, caps=()):
     k = bytearray(size)
     k[0:4] = b'KIP1'
     struct.pack_into('<Q', k, 0x10, program_id)
+    struct.pack_into('<I', k, 0x28, size - 0x100)
+    struct.pack_into('<32I', k, 0x80, *(list(caps) + [0xFFFFFFFF] * (32 - len(caps))))
     return bytes(k)
+
+
+def compile_check(src, *includes):
+    """Compile static_asserts against Atmosphère headers with devkitA64 (syntax only)."""
+    cmd = [GXX, '-std=gnu++23', '-fsyntax-only', '-fno-rtti', '-fno-exceptions', '-x', 'c++', '-',
+           '-D__SWITCH__', '-DATMOSPHERE', '-DATMOSPHERE_ARCH_ARM64', '-DATMOSPHERE_BOARD_NINTENDO_NX',
+           '-DATMOSPHERE_OS_HORIZON', '-DATMOSPHERE_CPU_ARM_CORTEX_A57', '-DATMOSPHERE_ARCH_ARM_V8A',
+           '-DATMOSPHERE_IS_EXOSPHERE', '-I' + os.path.join(AMS, 'libraries/libvapours/include'),
+           '-I' + os.path.join(AMS, 'libraries/libexosphere/include')] + ['-I' + i for i in includes]
+    return subprocess.run(cmd, input=src, capture_output=True, text=True)
 
 
 class TestMkpkg2(unittest.TestCase):
@@ -74,6 +91,26 @@ class TestMkpkg2(unittest.TestCase):
             else:
                 bad[off] = val
             self.assertFalse(mkpkg2.verify_package2(bytes(bad)), hex(off))
+
+    def test_ini1_roundtrip(self):
+        kips = [fake_kip(0x0100000000000004, 0x300), fake_kip(0x0100000000000028, 0x180)]
+        self.assertEqual(mkpkg2.split_ini1(mkpkg2.build_ini1(kips)), kips)
+
+    def test_kip_capabilities_checked(self):
+        for caps in ([0], [(0x3F << 16) | 0x7], [0x1F]):     # zero slot, CorePriority, unknown type
+            with self.assertRaises(ValueError):
+                mkpkg2.build_ini1([fake_kip(1, caps=caps)])
+        mkpkg2.build_ini1([fake_kip(1, caps=[0x0000000F, 0x00083FFF])])   # SyscallMask, KernelVersion
+
+    @unittest.skipUnless(os.path.exists(FW_INI1), 'HVM_FW not set')
+    def test_official_ini1(self):
+        kips = mkpkg2.split_ini1(read(FW_INI1))
+        self.assertEqual(len(kips), 7)
+        mkpkg2.build_ini1(kips)
+
+    @unittest.skipUnless(all(map(os.path.exists, AMS_KIPS)), 'stratosphere KIPs not built')
+    def test_atmosphere_kips(self):
+        mkpkg2.build_ini1([read(k) for k in AMS_KIPS])
 
     @unittest.skipUnless(os.path.exists(MESO), 'mesosphere.bin not built')
     def test_real_mesosphere(self):
@@ -133,13 +170,32 @@ class TestMkfuses(unittest.TestCase):
                   'chip_common.FUSE_OPT_OPS_RESERVED': mkfuses.FUSE_OPT_OPS_RESERVED}
         src = '#include <exosphere.hpp>\n#include "fuse_registers.hpp"\n#include <cstddef>\n'
         src += ''.join('static_assert(offsetof(ams::fuse::FuseRegisterRegion, %s) == 0x%x);\n' % kv for kv in fields.items())
-        lx = os.path.join(AMS, 'libraries/libexosphere')
-        cmd = [GXX, '-std=gnu++23', '-fsyntax-only', '-fno-rtti', '-fno-exceptions', '-x', 'c++', '-',
-               '-D__SWITCH__', '-DATMOSPHERE', '-DATMOSPHERE_ARCH_ARM64', '-DATMOSPHERE_BOARD_NINTENDO_NX',
-               '-DATMOSPHERE_OS_HORIZON', '-DATMOSPHERE_CPU_ARM_CORTEX_A57', '-DATMOSPHERE_ARCH_ARM_V8A',
-               '-DATMOSPHERE_IS_EXOSPHERE', '-I' + os.path.join(AMS, 'libraries/libvapours/include'),
-               '-I' + os.path.join(lx, 'include'), '-I' + os.path.join(lx, 'source/fuse')]
-        r = subprocess.run(cmd, input=src, capture_output=True, text=True)
+        r = compile_check(src, os.path.join(AMS, 'libraries/libexosphere/source/fuse'))
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+
+class TestMkexo0(unittest.TestCase):
+    def test_contents(self):
+        cfg = mkexo0.build_exo0()
+        self.assertEqual(len(cfg), mkexo0.EXO0_SIZE)
+        magic, tf, f0, f1 = struct.unpack_from('<4sIII', cfg, 0)
+        self.assertEqual((magic, tf, f0, f1), (b'EXO0', 0x16050000, 0b1010, 0))
+        self.assertEqual(struct.unpack_from('<I', mkexo0.build_exo0(user_exception_handlers=True), 8)[0], 0b10)
+        self.assertEqual(struct.unpack_from('<I', cfg, mkexo0.OFFSETS['log_baud_rate'])[0], 115200)
+
+    @unittest.skipUnless(os.path.exists(GXX), 'devkitA64 not available')
+    def test_layout_matches_atmosphere(self):
+        t = 'ams::secmon::SecureMonitorStorageConfiguration'
+        src = '#include <exosphere.hpp>\n#include <cstddef>\n'
+        src += ''.join('static_assert(offsetof(%s, %s) == 0x%x);\n' % (t, f, o) for f, o in mkexo0.OFFSETS.items())
+        src += 'static_assert(sizeof(%s) == 0x%x);\n' % (t, mkexo0.EXO0_SIZE)
+        src += 'static_assert(%s::Magic == 0x%08x);\n' % (t, struct.unpack('<I', b'EXO0')[0])
+        src += 'static_assert(static_cast<unsigned>(ams::TargetFirmware_Current) == 0x%x);\n' % mkexo0.TARGET_FIRMWARE_22_5_0
+        src += 'static_assert(ams::secmon::MemoryRegionPhysicalDramMonitorConfiguration.GetAddress() == 0x%x);\n' % mkexo0.EXO0_ADDRESS
+        for name, val in (('IsDevelopmentFunctionEnabledForKernel', mkexo0.FLAG_DEVFN_KERNEL),
+                          ('DisableUserModeExceptionHandlers', mkexo0.FLAG_DISABLE_USER_EXCEPTION_HANDLERS)):
+            src += 'static_assert(ams::secmon::SecureMonitorConfigurationFlag_%s == 0x%x);\n' % (name, val)
+        r = compile_check(src)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
 
