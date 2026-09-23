@@ -25,5 +25,5 @@ done
 ```sh
 scripts/run.sh --soc erista          # UART-A + QEMU monitor on stdio (Ctrl-A c), logs in ~/.horizonvm/logs
 scripts/run.sh --soc erista --gdb    # then: gdb-multiarch -x gdb/horizonvm.gdb -ex hvm-trace
-scripts/smoke.sh --soc erista        # headless boot check
+scripts/smoke.sh                     # headless boot check, erista + mariko
 ```

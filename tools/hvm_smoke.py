@@ -102,7 +102,7 @@ def main():
     os.umask(0o077)
 
     failed = False
-    for soc in args.soc or ['erista']:
+    for soc in args.soc or ['erista', 'mariko']:
         for name, ok in smoke(soc, args.timeout):
             print('%-7s %-6s %s' % (soc, 'PASS' if ok else 'FAIL', name))
             failed |= not ok
