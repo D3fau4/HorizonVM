@@ -112,7 +112,7 @@ def smoke(soc, ini, timeout):
         ('4 cores idle in WFI', idle_cores == {0, 1, 2, 3}),
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
-    ] + profile_checks(ini, trace)
+    ] + profile_checks(ini, trace, log)
 
 
 def user_smc_calls(trace):
@@ -132,14 +132,24 @@ def registered_by(trace, name):
     return {n for p, n in trace['registered'] if p in pids}
 
 
-def ams_checks(trace):
+def ams_checks(trace, log):
     names = set(trace['procs'].values())
+    set_version = [(a, r) for sid, a, r in user_smc_calls(trace) if sid == 0xC3000401 and a.get(1) == '0xfde8']
+    boot = pids_named(trace, 'boot')
+    boot_ports = [n for p, what, n in trace['ports'] if p in boot and what == 'ConnectToNamedPort']
     return [
         ('7 INI1 processes started', names == {'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl', 'FS'}),
         ('FS drives the eMMC (SDMMC4 MMIO)', 'sdmmc' in trace['mmio']),
         ('FS registers fsp-srv fsp-pr fsp-ldr', {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
         ('spl registers its services', SPL_SERVICES <= registered_by(trace, 'spl')),
         ('ncm mounted SYSTEM and its content meta DB: registers ncm lr', {'ncm', 'lr'} <= registered_by(trace, 'NCM')),
+        ('boot sets the real HOS version: SetConfig(65000, 22.5.0) -> 0 on core 3',
+         [(a.get(3), r.get(0)) for a, r in set_version] == [('0x16050000', '0x0')]),
+        ('loader registers ldr:pm ldr:shel ldr:dmnt', {'ldr:pm', 'ldr:shel', 'ldr:dmnt'} <= registered_by(trace, 'Loader')),
+        ('pm registers pm:shell pm:dmnt pm:bm pm:info',
+         {'pm:shell', 'pm:dmnt', 'pm:bm', 'pm:info'} <= registered_by(trace, 'ProcessMana')),
+        ('frontier: boot waits for bpc:ams (ams_mitm is F3)', boot_ports.count('bpc:ams') >= 2),
+        ('no process exited', 'KProcess::Exit()' not in log and 'KProcess::Terminate()' not in log),
     ]
 
 
@@ -147,11 +157,11 @@ def pids_named(trace, name):
     return {p for p, n in trace['procs'].items() if n == name}
 
 
-def profile_checks(ini, trace):
+def profile_checks(ini, trace, log):
     if ini == 'empty':
         return []
     if ini == 'ams':
-        return ams_checks(trace)
+        return ams_checks(trace, log)
     calls = user_smc_calls(trace)
     get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
     sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')
