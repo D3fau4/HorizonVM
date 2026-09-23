@@ -25,5 +25,9 @@ done
 ```sh
 scripts/run.sh --soc erista          # UART-A + QEMU monitor on stdio (Ctrl-A c), logs in ~/.horizonvm/logs
 scripts/run.sh --soc erista --gdb    # then: gdb-multiarch -x gdb/horizonvm.gdb -ex hvm-trace
+scripts/run.sh --soc erista --trace  # + hvmtrace plugin: SMC/MMIO log (secrets redacted at the source)
+tools/hvm_log.py --soc erista        # summarize/check SMC, MMIO per device, exceptions
 scripts/smoke.sh                     # headless boot check, erista + mariko
 ```
+
+Raw logs live in `~/.horizonvm/logs` (private); share only `hvm_log.py` summaries.

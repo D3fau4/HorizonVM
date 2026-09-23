@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import hvm_log  # noqa: E402
 import mkfuses  # noqa: E402
 import mkpkg2   # noqa: E402
 
@@ -174,6 +175,46 @@ class TestHvmKeys(unittest.TestCase):
             self.assertEqual(read(os.path.join(d, 'mariko/aeskeyslot12.bin')), bytes.fromhex(self.KEK))
         finally:
             shutil.rmtree(d)
+
+
+class TestHvmLog(unittest.TestCase):
+    GOOD = ('smc cpu=0 el=1 pc=0x800c3048 id=0xc4000003 x1=0x1 x2=0x800d1200 x3=0x0 x4=0x0 x5=0x0 x6=0x0 x7=0x0\n'
+            'smc_ret cpu=0 el=1 pc=0x800c304c id=0xc4000003 x0=0x0 x1=0x1 x2=0x0 x3=0x0\n'
+            'smc_ret cpu=0 el=1 pc=0x800c304c id=0xc3000005 x0=<redacted> x1=<redacted> x2=<redacted> x3=<redacted>\n'
+            'mmio cpu=0 pc=0x1f0000000 W addr=0x50041100 size=4 val=0xffffffff\n'
+            'mmio cpu=0 pc=0x1f0000000 W addr=0x70012300 size=4 val=<redacted>\n')
+    QEMU = 'Taking exception 5 [IRQ] on CPU 0\n...from EL1 to EL1\n'
+
+    def analyze(self, trace, qemu=QEMU):
+        d = tempfile.mkdtemp()
+        try:
+            t, q = os.path.join(d, 't'), os.path.join(d, 'q')
+            with open(t, 'w') as f:
+                f.write(trace)
+            with open(q, 'w') as f:
+                f.write(qemu)
+            return hvm_log.analyze(t, q)
+        finally:
+            shutil.rmtree(d)
+
+    def test_clean_trace(self):
+        r = self.analyze(self.GOOD)
+        self.assertEqual(r['violations'], [])
+        self.assertEqual(r['smc'][0xC4000003], 1)
+        self.assertEqual(r['mmio']['gic_dist']['W'], 1)
+
+    def test_violations(self):
+        cases = {
+            'mmio cpu=0 pc=0x0 W addr=0x57000000 size=4 val=0x1\n': 'gpu',
+            'mmio cpu=0 pc=0x0 W addr=0x70012300 size=4 val=0x1234\n': 'not redacted',
+            'smc cpu=0 el=1 pc=0x0 id=0xc3000002 x1=<redacted>\n': 'unknown SMC',
+            'smc_ret cpu=0 el=1 pc=0x0 id=0xc3000005 x0=0x0 x1=0x5\n': 'RNG',
+        }
+        for line, expect in cases.items():
+            v = self.analyze(self.GOOD + line)['violations']
+            self.assertTrue(any(expect in x for x in v), (line, v))
+        v = self.analyze(self.GOOD, 'Taking exception 1 [Undefined Instruction] on CPU 0\n...from EL1 to EL2\n')['violations']
+        self.assertTrue(v)
 
 
 if __name__ == '__main__':

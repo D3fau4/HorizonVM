@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 
+import hvm_log
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 HVM = os.environ.get('HORIZONVM_HOME', os.path.expanduser('~/.horizonvm'))
 KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/nintendo_nx_arm64_armv8a/debug/kernel.elf')
@@ -65,7 +67,7 @@ def smoke(soc, timeout):
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
@@ -84,6 +86,10 @@ def smoke(soc, timeout):
         log = f.read().decode('latin-1')
     state = re.search(r'^[0-9a-f]+: (0x[0-9a-f]+)', mon, re.M)
     pcs = [int(p, 16) - base for p in re.findall(r'PC=([0-9a-f]+)', mon)] if base else []
+    trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
+                            os.path.join(HVM, 'logs', 'qemu-%s.log' % soc))
+    for v in trace['violations']:
+        print('%-7s trace: %s' % (soc, v))
     return [
         ('exosphere OHAYO (single boot)', log.count('OHAYO') == 1),
         ('exosphere KeyGen 15', '[secmon] KeyGen: 15' in log),
@@ -91,6 +97,8 @@ def smoke(soc, timeout):
         ('no kernel panic', 'Kernel Panic' not in log),
         ('Kernel::s_state == Initialized', bool(state) and int(state.group(1), 16) == KERNEL_STATE_INITIALIZED),
         ('4 cores idle in WFI', len(pcs) == 4 and all(idle[0] <= p <= idle[1] for p in pcs)),
+        ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][0xC4000003] == 3),
+        ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted', not trace['violations']),
     ]
 
 

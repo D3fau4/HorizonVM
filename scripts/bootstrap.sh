@@ -25,3 +25,8 @@ if [ ! -f build.ninja ]; then
         --disable-werror ${QEMU_CONFIGURE_EXTRA:-}
 fi
 ninja -j"$(nproc)" qemu-system-aarch64
+
+# HorizonVM TCG plugin (SMC/MMIO tracing with secret redaction).
+mkdir -p "$ROOT/build/plugins"
+cc -O2 -Wall -shared -fPIC -I"$TQ/include/qemu" $(pkg-config --cflags glib-2.0) \
+    "$ROOT/plugins/hvmtrace.c" -o "$ROOT/build/plugins/libhvmtrace.so"

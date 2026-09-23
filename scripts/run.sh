@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
-# usage: run.sh [--soc erista|mariko] [--gdb] [-- extra qemu args]
+# usage: run.sh [--soc erista|mariko] [--gdb] [--trace] [-- extra qemu args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,11 +9,13 @@ OUT=nintendo_nx_arm64_armv8a/debug
 AMS="$ROOT/third_party/Atmosphere"
 SOC=erista
 GDB=()
+TRACE=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --soc) SOC="$2"; shift 2 ;;
         --gdb) GDB=(-s -S); shift ;;
+        --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log"); shift ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -46,6 +48,7 @@ fi
 
 umask 077
 mkdir -p "$HVM/logs"
+TRACE=("${TRACE[@]/SOC/$SOC}")
 
 # Replaces fusee: 0x400000F8 is SecureMonitorParameters.bootloader_state (4 = BootloaderState_Done),
 # 0xA9800000 is where exosphere expects the plaintext package2 (secmon_memory_layout.hpp).
@@ -58,4 +61,4 @@ exec "$ROOT/build/qemu/qemu-system-aarch64" \
     -device loader,addr=0x400000F8,data-len=4,data=4 \
     "${SECRETS[@]}" "${EXTRA[@]}" \
     -d int,guest_errors -D "$HVM/logs/qemu-$SOC.log" \
-    "${GDB[@]}" "$@"
+    "${TRACE[@]}" "${GDB[@]}" "$@"
