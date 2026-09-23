@@ -1,0 +1,31 @@
+Add opt-in tegra.flow 'cop-halted' so exosphere's BPMP-halted wait passes without emulating the BPMP.
+
+diff --git a/hw/arm/tegra2/ppsb/flow/flow.c b/hw/arm/tegra2/ppsb/flow/flow.c
+index 13f9fb6..ffa5151 100644
+--- a/hw/arm/tegra2/ppsb/flow/flow.c
++++ b/hw/arm/tegra2/ppsb/flow/flow.c
+@@ -75,6 +75,7 @@ typedef struct tegra_flow_state {
+ 
+     MemoryRegion iomem;
+     uint32_t num_cpu;
++    bool cop_halted;
+     ptimer_state *ptimer[TEGRA_NCPUS];
+     DEFINE_REG32(halt_events)[TEGRA_NCPUS];
+     DEFINE_REG32(csr)[TEGRA_NCPUS];
+@@ -786,7 +787,7 @@ static void tegra_flow_priv_reset(DeviceState *dev)
+     s->csr[TEGRA_CCPLEX_CORE3].reg32 = CPU_CSR_RESET;
+ 
+     s->halt_events[TEGRA_BPMP].reg32 = HALT_COP_EVENTS_RESET;
+-    //if (s->num_cpu>=TEGRAX1_CCPLEX_NCORES) s->halt_events[TEGRA_BPMP].reg32 |= (2<<29); // Tell secmon BPMP is halted. This is only needed when not emulating the BPMP.
++    if (s->cop_halted) s->halt_events[TEGRA_BPMP].reg32 |= (2<<29); // Tell secmon BPMP is halted (FLOW_MODE_STOP). Only for booting the CCPLEX without the BPMP.
+     s->csr[TEGRA_BPMP].reg32 = COP_CSR_RESET;
+ 
+     s->xrq_events.reg32 = XRQ_EVENTS_RESET;
+@@ -840,6 +841,7 @@ static void tegra_flow_priv_realize(DeviceState *dev, Error **errp)
+ 
+ static Property tegra_flow_properties[] = {
+     DEFINE_PROP_UINT32("num-cpu", tegra_flow, num_cpu, TEGRA_CCPLEX_NCORES), \
++    DEFINE_PROP_BOOL("cop-halted", tegra_flow, cop_halted, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
