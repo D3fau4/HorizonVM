@@ -1,8 +1,8 @@
 /*
  * hvmtrace: QEMU TCG plugin logging AArch64 SMC calls/returns, EL0 SVCs and MMIO accesses for HorizonVM.
  * usage: -plugin libhvmtrace.so,out=<file>[,mmio=off][,smc=off][,svc=off]
- * Secrets are redacted at the source: SE/SE2/PKA1 MMIO values, crypto SMC arguments/results, and no IPC
- * message is dumped except requests to sm (service names).
+ * Secrets are redacted at the source: SE/SE2/PKA1 MMIO values, crypto SMC arguments/results. Of IPC messages
+ * only the header is decoded (command id, result code); payloads are dumped only for sm (service names, handles).
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -21,6 +21,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define SVC_SEND_SYNC_REQUEST_WITH_USER_BUF 0x22
 #define SVC_MANAGE_NAMED_PORT               0x71
 #define SM_MSG_LOG_SIZE                     0x40
+#define IPC_HEADER_READ                     0x80
 
 static FILE *out;
 static GMutex lock;
@@ -36,9 +37,14 @@ typedef struct {
 } VcpuState;
 static VcpuState vcpus[MAX_VCPUS];
 
+enum { IPC_NONE, IPC_CMIF, IPC_TIPC };
+
 typedef struct {
     uint64_t ret_pc, id;
     bool connect_sm;   /* ConnectToNamedPort("sm:"): remember the returned handle */
+    bool sm_session;   /* request to sm: dump its reply too (moved service handle) */
+    int ipc_kind;      /* protocol of a SendSyncRequest, to find the result code in the reply */
+    uint64_t msg_va;   /* TLS or user buffer holding the message */
 } SvcCall;
 
 static const struct { uint64_t start, end; } redacted_mmio[] = {
@@ -65,6 +71,12 @@ static bool smc_args_public(uint64_t imm, uint64_t id)
         return id == 0xC3000002 || id == 0xC3000401;   /* GetConfig / SetConfig */
     }
     return false;
+}
+
+/* Per-register exceptions: user GenerateAesKek's generation (x3) and option flags (x4) are not secret. */
+static bool smc_arg_public(uint64_t imm, uint64_t id, int reg)
+{
+    return smc_args_public(imm, id) || (imm == 0 && id == 0xC3000007 && (reg == 3 || reg == 4));
 }
 
 static bool smc_results_public(uint64_t imm, uint64_t id)
@@ -107,13 +119,15 @@ static void append_regs(GString *line, VcpuState *s, int first, int last, bool p
 }
 
 static void log_smc_regs(const char *tag, unsigned int cpu, uint64_t pc, uint64_t imm, uint64_t id,
-                         int first, int last, bool public)
+                         int first, int last, bool args)
 {
     VcpuState *s = &vcpus[cpu];
     GString *line = g_string_new(NULL);
     g_string_append_printf(line, "%s cpu=%u el=%" PRIu64 " pc=0x%" PRIx64 " imm=%" PRIu64 " id=0x%" PRIx64,
                            tag, cpu, (read_reg(s->cpsr) >> 2) & 3, pc, imm, id);
-    append_regs(line, s, first, last, public);
+    for (int i = first; i <= last; i++) {
+        append_regs(line, s, i, i, args ? smc_arg_public(imm, id, i) : smc_results_public(imm, id));
+    }
     emit(line, true);
 }
 
@@ -135,7 +149,7 @@ static void on_smc(unsigned int cpu, void *udata)
         memcpy(&op, insn->data, 4);
     }
     uint64_t imm = (op >> 5) & 0xFFFF;
-    log_smc_regs("smc", cpu, pc, imm, id, 1, 7, smc_args_public(imm, id));
+    log_smc_regs("smc", cpu, pc, imm, id, 1, 7, true);
     s->pending_ret = pc + 4;
     s->pending_id = id;
     s->pending_imm = imm;
@@ -149,8 +163,7 @@ static void on_smc_return(unsigned int cpu, void *udata)
     }
     VcpuState *s = &vcpus[cpu];
     s->pending_ret = 0;
-    log_smc_regs("smc_ret", cpu, pc, s->pending_imm, s->pending_id, 0, 3,
-                 smc_results_public(s->pending_imm, s->pending_id));
+    log_smc_regs("smc_ret", cpu, pc, s->pending_imm, s->pending_id, 0, 3, false);
 }
 
 /* Threads are identified by process id (CONTEXTIDR_EL1, cpu::SwitchProcess) and their TLS (TPIDRRO_EL0). */
@@ -189,6 +202,55 @@ static void append_user_hex(GString *line, const char *field, uint64_t va, size_
     for (guint i = 0; i < buf->len; i++) {
         g_string_append_printf(line, "%02x", buf->data[i]);
     }
+}
+
+/*
+ * Offset of the raw data of an IPC message (hipc header, special header, descriptors), as laid out by
+ * libnx/libstratosphere hipc. CMIF aligns its "SFCI"/"SFCO" header to 16 bytes; tipc data follows directly.
+ */
+static size_t ipc_data_offset(const uint8_t *m)
+{
+    uint32_t w0, w1, sh = 0;
+    memcpy(&w0, m, 4);
+    memcpy(&w1, m + 4, 4);
+    size_t off = 8;
+    if (w1 >> 31) {
+        memcpy(&sh, m + 8, 4);
+        off = 12 + ((sh & 1) ? 8 : 0) + 4 * (((sh >> 1) & 0xF) + ((sh >> 5) & 0xF));
+    }
+    return off + 8 * ((w0 >> 16) & 0xF) + 12 * (((w0 >> 20) & 0xF) + ((w0 >> 24) & 0xF) + ((w0 >> 28) & 0xF));
+}
+
+/* Request: protocol + command id. Reply: result code. Only header words are read, never the payload. */
+static bool ipc_decode(uint64_t va, bool reply, int *kind, uint32_t *value)
+{
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    if (!qemu_plugin_read_memory_vaddr(va, buf, IPC_HEADER_READ) || buf->len < IPC_HEADER_READ) {
+        return false;
+    }
+    const uint8_t *m = buf->data;
+    size_t off = ipc_data_offset(m);
+    uint32_t type = m[0] | (m[1] << 8);
+    if (!reply) {
+        *kind = type >= 16 ? IPC_TIPC : (type == 4 || type == 5 || type == 6) ? IPC_CMIF : IPC_NONE;
+        if (*kind == IPC_TIPC) {
+            *value = type - 16;
+            return true;
+        }
+    }
+    if (*kind == IPC_CMIF) {
+        off = (off + 15) & ~(size_t)15;
+        if (off + 12 > IPC_HEADER_READ || memcmp(m + off, reply ? "SFCO" : "SFCI", 4)) {
+            return false;
+        }
+        memcpy(value, m + off + 8, 4);
+        return true;
+    }
+    if (*kind == IPC_TIPC && reply && off + 4 <= IPC_HEADER_READ) {
+        memcpy(value, m + off, 4);
+        return true;
+    }
+    return false;
 }
 
 static void on_svc(unsigned int cpu, void *udata)
@@ -234,9 +296,17 @@ static void on_svc(unsigned int cpu, void *udata)
         append_user_string(line, "name", x1, 12);
         call->connect_sm = id == SVC_CONNECT_TO_NAMED_PORT && qemu_plugin_read_memory_vaddr(x1, name, 4) &&
                            name->len == 4 && !memcmp(name->data, "sm:\0", 4);
-    } else if (sm_session) {
-        /* Only sm requests are dumped: they carry service names, never key material. */
-        append_user_hex(line, "sm_msg", id == SVC_SEND_SYNC_REQUEST ? tls : x0, SM_MSG_LOG_SIZE);
+    } else if (id == SVC_SEND_SYNC_REQUEST || id == SVC_SEND_SYNC_REQUEST_WITH_USER_BUF) {
+        uint32_t cmd;
+        call->msg_va = id == SVC_SEND_SYNC_REQUEST ? tls : x0;
+        call->sm_session = sm_session;
+        if (ipc_decode(call->msg_va, false, &call->ipc_kind, &cmd)) {
+            g_string_append_printf(line, " ipc=%s:%u", call->ipc_kind == IPC_TIPC ? "tipc" : "cmif", cmd);
+        }
+        if (sm_session) {
+            /* Only sm requests are dumped: they carry service names, never key material. */
+            append_user_hex(line, "sm_msg", call->msg_va, SM_MSG_LOG_SIZE);
+        }
     }
     emit(line, false);
 
@@ -261,8 +331,9 @@ static void on_svc_return(unsigned int cpu, void *udata)
         g_mutex_unlock(&lock);
         return;
     }
-    uint64_t id = call->id;
-    bool connect_sm = call->connect_sm;
+    uint64_t id = call->id, msg_va = call->msg_va;
+    bool connect_sm = call->connect_sm, sm_session = call->sm_session;
+    int ipc_kind = call->ipc_kind;
     g_hash_table_remove(svc_pending, key);
     uint64_t x0 = read_reg(s->x[0]), x1 = read_reg(s->x[1]);
     if (connect_sm && x0 == 0) {
@@ -274,6 +345,13 @@ static void on_svc_return(unsigned int cpu, void *udata)
     g_string_append_printf(line, "svc_ret cpu=%u pid=%" PRIu64 " tls=0x%" PRIx64 " pc=0x%" PRIx64 " id=0x%" PRIx64,
                            cpu, pid, tls, pc, id);
     append_regs(line, s, 0, 3, true);
+    uint32_t result;
+    if (ipc_kind != IPC_NONE && x0 == 0 && ipc_decode(msg_va, true, &ipc_kind, &result)) {
+        g_string_append_printf(line, " ipc_result=0x%x", result);
+    }
+    if (sm_session && x0 == 0) {
+        append_user_hex(line, "sm_reply", msg_va, SM_MSG_LOG_SIZE);   /* moved service handle */
+    }
     emit(line, false);
 }
 

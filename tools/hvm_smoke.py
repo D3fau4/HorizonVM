@@ -16,10 +16,13 @@ KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/ni
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
 PROFILES = ('empty', 'core', 'ams', 'stock')
-SETTLE = {'empty': 5, 'core': 8, 'ams': 15, 'stock': 30}     # seconds after the kernel layout / READY
-# Trace line that marks a profile's userland milestone (smc lines are flushed as they happen):
-# boot's SetConfig(ExosphereApiVersion) through spl, i.e. the real HOS version is known.
-READY = {'ams': r'smc_ret cpu=3 el=1 pc=0x[0-9a-f]+ imm=0 id=0xc3000401 x0=0x0 x1=0xfde8'}
+SETTLE = {'empty': 5, 'core': 8, 'ams': 15, 'stock': 10}     # seconds after the kernel layout / READY
+# Line that marks a profile's userland milestone, in the trace (smc lines are flushed as they happen) or on the
+# UART: boot's SetConfig(ExosphereApiVersion) through spl (ams), Nintendo's boot exiting after NotifyBootFinished.
+READY = {'ams': ('trace', r'smc_ret cpu=3 el=1 pc=0x[0-9a-f]+ imm=0 id=0xc3000401 x0=0x0 x1=0xfde8'),
+         'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot')}
+EXTRA_ALLOWED = {'stock': hvm_log.ALLOWED_BOOT_HW}
+LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
 IDLE_SAMPLES = 5
 SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
@@ -81,7 +84,8 @@ def smoke(soc, ini, timeout):
         m = wait_for(uart, r'KernelRegion[^\n]*\n\s+Code\s+(0x[0-9a-f]+)', proc, timeout)
         base = int(m.group(1), 16) if m else None
         if base is not None and ini in READY:
-            wait_for(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc), READY[ini], proc, timeout)
+            where, pattern = READY[ini]
+            wait_for(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc) if where == 'trace' else uart, pattern, proc, timeout)
         time.sleep(SETTLE[ini])   # let init finish and the cores go idle
         mon, samples = '', []
         if base is not None and proc.poll() is None:
@@ -100,7 +104,8 @@ def smoke(soc, ini, timeout):
     idle_cores = {c for pcs in samples if len(pcs) == 4 for c, p in enumerate(pcs) if idle[0] <= p <= idle[1]}
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'qemu-%s.log' % soc),
-                            os.path.join(HVM, 'logs', 'uart-%s.log' % soc))
+                            os.path.join(HVM, 'logs', 'uart-%s.log' % soc),
+                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})))
     for v in trace['violations']:
         print('%-7s %-5s trace: %s' % (soc, ini, v))
     return [
@@ -153,6 +158,29 @@ def ams_checks(trace, log):
     ]
 
 
+def stock_checks(trace, log):
+    """Nintendo's own 22.5.0 INI1 on exosphere + Mesosphere + the synthetic NAND."""
+    names = set(trace['procs'].values())
+    boot = pids_named(trace, 'boot')
+    pm = pids_named(trace, 'ProcessMana')
+    return [
+        ('7 official INI1 processes started', names == {'FS', 'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl'}),
+        ('FS drives the eMMC and registers fsp-srv fsp-pr fsp-ldr',
+         'sdmmc' in trace['mmio'] and {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
+        ('spl, ncm, loader and pm register their services',
+         SPL_SERVICES <= registered_by(trace, 'spl') and {'ncm', 'lr'} <= registered_by(trace, 'NCM')
+         and {'ldr:pm', 'ldr:shel', 'ldr:dmnt'} <= registered_by(trace, 'Loader')
+         and {'pm:shell', 'pm:dmnt', 'pm:bm', 'pm:info'} <= registered_by(trace, 'ProcessMana')),
+        ('boot initializes I2C/GPIO/PWM/display, notifies pm:shell and exits',
+         {'i2c', 'gpio', 'pwm', 'host1x_modules'} <= set(trace['mmio'])
+         and any(p in boot and n == 'pm:shell' for p, n in trace['lookups'])
+         and re.search(r'KProcess::Exit\(\) pid=\d+ name=boot', log) is not None),
+        ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
+         any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND
+             for p, svc, cmd, rc in trace['ipc_failures'])),
+    ]
+
+
 def pids_named(trace, name):
     return {p for p, n in trace['procs'].items() if n == name}
 
@@ -162,6 +190,8 @@ def profile_checks(ini, trace, log):
         return []
     if ini == 'ams':
         return ams_checks(trace, log)
+    if ini == 'stock':
+        return stock_checks(trace, log)
     calls = user_smc_calls(trace)
     get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
     sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')

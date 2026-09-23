@@ -430,6 +430,22 @@ class TestHvmLog(unittest.TestCase):
         self.assertEqual(blocked, {(1, '1000'): 'ReplyAndReceive', (2, '9000'): 'sm GetServiceHandle(fsp-pr)'})
         self.assertEqual(hvm_log.decode_sm(tipc(0, pid=True)), ('RegisterClient', None))
 
+    def test_ipc_results_and_handles(self):
+        reply = struct.pack('<IIII', 0, (1 << 31) | 3, 1 << 5, 0xd00a).ljust(0x40, b'\0')   # one moved handle
+        lookup = tipc(1, b'ldr:pm').hex()
+        trace = ('svc cpu=3 pid=4 tls=0x9000 pc=0x300 id=0x21 x0=0xd001 x1=0x0 x2=0x0 x3=0x0 ipc=tipc:1 sm_msg=%s\n'
+                 'svc_ret cpu=3 pid=4 tls=0x9000 pc=0x304 id=0x21 x0=0x0 x1=0x0 x2=0x0 x3=0x0 ipc_result=0x0 sm_reply=%s\n'
+                 'svc cpu=3 pid=4 tls=0x9000 pc=0x300 id=0x21 x0=0xd00a x1=0x0 x2=0x0 x3=0x0 ipc=cmif:1\n'
+                 'svc_ret cpu=3 pid=4 tls=0x9000 pc=0x304 id=0x21 x0=0x0 x1=0x0 x2=0x0 x3=0x0 ipc_result=0x408\n'
+                 % (lookup, reply.hex()))
+        r = self.analyze(trace)
+        self.assertEqual(dict(r['ipc_failures']), {(4, 'ldr:pm', 1, 0x408): 1})
+        self.assertEqual(hvm_log.result_str(0x408), '2008-0002')
+
+    def test_generate_aes_kek_generation_is_public(self):
+        ok = 'smc cpu=3 el=1 pc=0x0 imm=0 id=0xc3000007 x1=<redacted> x2=<redacted> x3=0x16 x4=0x0 x5=<redacted>\n'
+        self.assertEqual(self.analyze(self.GOOD + ok)['violations'], [])
+
     def test_violations(self):
         cases = {
             'mmio cpu=0 pc=0x0 W addr=0x57000000 size=4 val=0x1\n': 'gpu',
