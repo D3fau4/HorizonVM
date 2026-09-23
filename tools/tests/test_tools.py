@@ -233,44 +233,87 @@ class TestHvmKeys(unittest.TestCase):
             shutil.rmtree(d)
 
 
+def tipc(cmd, name=b'', pid=False):
+    """A tipc request as it sits in TLS (sm_msg dump)."""
+    words = [16 + cmd, (1 << 31) if pid else 0]
+    body = struct.pack('<II', *words)
+    if pid:
+        body += struct.pack('<IQ', 1, 0x55)
+    return (body + name.ljust(8, b'\0')).ljust(0x30, b'\0')
+
+
 class TestHvmLog(unittest.TestCase):
-    GOOD = ('smc cpu=0 el=1 pc=0x800c3048 id=0xc4000003 x1=0x1 x2=0x800d1200 x3=0x0 x4=0x0 x5=0x0 x6=0x0 x7=0x0\n'
-            'smc_ret cpu=0 el=1 pc=0x800c304c id=0xc4000003 x0=0x0 x1=0x1 x2=0x0 x3=0x0\n'
-            'smc_ret cpu=0 el=1 pc=0x800c304c id=0xc3000005 x0=<redacted> x1=<redacted> x2=<redacted> x3=<redacted>\n'
+    GOOD = ('smc cpu=0 el=1 pc=0x800c3048 imm=1 id=0xc4000003 x1=0x1 x2=0x800d1200 x3=0x0 x4=0x0 x5=0x0 x6=0x0 x7=0x0\n'
+            'smc_ret cpu=0 el=1 pc=0x800c304c imm=1 id=0xc4000003 x0=0x0 x1=0x1 x2=0x0 x3=0x0\n'
+            'smc_ret cpu=0 el=1 pc=0x800c304c imm=1 id=0xc3000005 x0=<redacted> x1=<redacted> x2=<redacted> x3=<redacted>\n'
+            'smc cpu=3 el=1 pc=0x800c3100 imm=0 id=0xc3000002 x1=0xfde8 x2=0x0 x3=0x0 x4=0x0 x5=0x0 x6=0x0 x7=0x0\n'
+            'smc_ret cpu=3 el=1 pc=0x800c3104 imm=0 id=0xc3000002 x0=0x7 x1=0x0 x2=0x0 x3=0x0\n'
+            'smc cpu=3 el=1 pc=0x800c3100 imm=0 id=0xc3000006 x1=<redacted> x2=<redacted> x3=<redacted> '
+            'x4=<redacted> x5=<redacted> x6=<redacted> x7=<redacted>\n'
             'mmio cpu=0 pc=0x1f0000000 W addr=0x50041100 size=4 val=0xffffffff\n'
             'mmio cpu=0 pc=0x1f0000000 W addr=0x70012300 size=4 val=<redacted>\n')
-    QEMU = 'Taking exception 5 [IRQ] on CPU 0\n...from EL1 to EL1\n'
+    QEMU = ('Taking exception 5 [IRQ] on CPU 0\n...from EL1 to EL1\n...with ESR 0x15/0x56000000\n'
+            'Taking exception 2 [SVC] on CPU 3\n...from EL0 to EL1\n...with ESR 0x15/0x5600001f\n'
+            'Taking exception 1 [Undefined Instruction] on CPU 3\n...from EL0 to EL1\n...with ESR 0x7/0x1fe00000\n')
+    UART = 'KProcess::Run() pid=1 name=sm           thread=1\nKProcess::Run() pid=2 name=spl          thread=2\n'
 
-    def analyze(self, trace, qemu=QEMU):
+    def analyze(self, trace, qemu=QEMU, uart=UART):
         d = tempfile.mkdtemp()
         try:
-            t, q = os.path.join(d, 't'), os.path.join(d, 'q')
-            with open(t, 'w') as f:
-                f.write(trace)
-            with open(q, 'w') as f:
-                f.write(qemu)
-            return hvm_log.analyze(t, q)
+            t, q, u = os.path.join(d, 't'), os.path.join(d, 'q'), os.path.join(d, 'u')
+            for path, text in ((t, trace), (q, qemu), (u, uart)):
+                with open(path, 'w') as f:
+                    f.write(text)
+            return hvm_log.analyze(t, q, u)
         finally:
             shutil.rmtree(d)
 
     def test_clean_trace(self):
         r = self.analyze(self.GOOD)
         self.assertEqual(r['violations'], [])
-        self.assertEqual(r['smc'][0xC4000003], 1)
+        self.assertEqual(r['smc'][(1, 0xC4000003)], 1)
+        self.assertEqual(r['smc'][(0, 0xC3000002)], 1)
         self.assertEqual(r['mmio']['gic_dist']['W'], 1)
+        self.assertEqual(r['exc'][('FP access', 'EL0', 'EL1')], 1)
+        self.assertEqual(r['procs'], {1: 'sm', 2: 'spl'})
+
+    def test_svc_and_sm(self):
+        trace = ('svc cpu=3 pid=1 tls=0x1000 pc=0x100 id=0x71 x0=0x0 x1=0x2000 x2=0x40 x3=0x0 name=sm:\n'
+                 'svc_ret cpu=3 pid=1 tls=0x1000 pc=0x104 id=0x71 x0=0x0 x1=0xd000 x2=0x0 x3=0x0\n'
+                 'svc cpu=3 pid=1 tls=0x1000 pc=0x200 id=0x43 x0=0x0 x1=0x3000 x2=0x1 x3=0x0\n'
+                 'svc cpu=3 pid=2 tls=0x9000 pc=0x300 id=0x21 x0=0xd001 x1=0x0 x2=0x0 x3=0x0 sm_msg=%s\n'
+                 'svc_ret cpu=3 pid=2 tls=0x9000 pc=0x304 id=0x21 x0=0x0 x1=0x0 x2=0x0 x3=0x0\n'
+                 'svc cpu=3 pid=2 tls=0x9000 pc=0x300 id=0x21 x0=0xd001 x1=0x0 x2=0x0 x3=0x0 sm_msg=%s\n'
+                 % (tipc(2, b'spl:').hex(), tipc(1, b'fsp-pr').hex()))
+        r = self.analyze(trace)
+        self.assertEqual(r['violations'], [])
+        self.assertEqual(r['ports'], [(1, 'ManageNamedPort', 'sm:')])
+        self.assertEqual(r['registered'], [(2, 'spl:')])
+        self.assertEqual(r['lookups'], [(2, 'fsp-pr')])
+        blocked = {k: v[1] for k, v in r['pending'].items()}
+        self.assertEqual(blocked, {(1, '1000'): 'ReplyAndReceive', (2, '9000'): 'sm GetServiceHandle(fsp-pr)'})
+        self.assertEqual(hvm_log.decode_sm(tipc(0, pid=True)), ('RegisterClient', None))
 
     def test_violations(self):
         cases = {
             'mmio cpu=0 pc=0x0 W addr=0x57000000 size=4 val=0x1\n': 'gpu',
             'mmio cpu=0 pc=0x0 W addr=0x70012300 size=4 val=0x1234\n': 'not redacted',
-            'smc cpu=0 el=1 pc=0x0 id=0xc3000002 x1=<redacted>\n': 'unknown SMC',
-            'smc_ret cpu=0 el=1 pc=0x0 id=0xc3000005 x0=0x0 x1=0x5\n': 'RNG',
+            'smc cpu=0 el=1 pc=0x0 imm=1 id=0xc3000002 x1=<redacted>\n': 'unknown SMC',
+            'smc_ret cpu=0 el=1 pc=0x0 imm=1 id=0xc3000005 x0=0x0 x1=0x5\n': 'not redacted',
+            'smc cpu=3 el=1 pc=0x0 imm=0 id=0xc3000007 x1=0x1234 x2=<redacted>\n': 'GenerateAesKek not redacted',
+            'smc_ret cpu=3 el=1 pc=0x0 imm=0 id=0xc3000006 x0=0x0 x1=0xabcd\n': 'GenerateRandomBytes not redacted',
+            'smc cpu=1 el=1 pc=0x0 imm=0 id=0xc3000002 x1=0x3\n': 'core 1',
         }
         for line, expect in cases.items():
             v = self.analyze(self.GOOD + line)['violations']
             self.assertTrue(any(expect in x for x in v), (line, v))
-        v = self.analyze(self.GOOD, 'Taking exception 1 [Undefined Instruction] on CPU 0\n...from EL1 to EL2\n')['violations']
-        self.assertTrue(v)
+        for qemu in ('Taking exception 1 [Undefined Instruction] on CPU 0\n...from EL1 to EL2\n',
+                     'Taking exception 4 [Data Abort] on CPU 3\n...from EL0 to EL1\n...with ESR 0x24/0x92000007\n',
+                     'Taking exception 1 [Undefined Instruction] on CPU 3\n...from EL0 to EL1\n...with ESR 0x0/0x2000000\n'):
+            self.assertTrue(self.analyze(self.GOOD, qemu)['violations'], qemu)
+        for uart in ('Exception occurred. 0100000000000028\n', 'Core[3]: Kernel Panic at x.cpp:1\n',
+                     "Abort: 'R_SUCCEEDED(rc)' in Main, process=0x02, thread=5 (main)\n"):
+            self.assertTrue(self.analyze(self.GOOD, uart=uart)['violations'], uart)
 
 
 if __name__ == '__main__':

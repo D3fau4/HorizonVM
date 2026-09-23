@@ -16,6 +16,9 @@ KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/ni
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
 PROFILES = ('empty', 'core', 'ams', 'stock')
+SETTLE = {'empty': 5, 'core': 8, 'ams': 30, 'stock': 30}     # seconds after the kernel layout is printed
+IDLE_SAMPLES = 5
+SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 
@@ -74,11 +77,14 @@ def smoke(soc, ini, timeout):
     try:
         m = wait_for(uart, r'KernelRegion[^\n]*\n\s+Code\s+(0x[0-9a-f]+)', proc, timeout)
         base = int(m.group(1), 16) if m else None
-        time.sleep(5)   # let init finish and the cores go idle
-        mon = ''
+        time.sleep(SETTLE[ini])   # let init finish and the cores go idle
+        mon, samples = '', []
         if base is not None and proc.poll() is None:
-            cmds = ['x /1bx 0x%x' % (base + s_state_off)] + sum([['cpu %d' % c, 'info registers'] for c in range(4)], [])
-            mon = monitor(sock, cmds)
+            mon = monitor(sock, ['x /1bx 0x%x' % (base + s_state_off)])
+            for _ in range(IDLE_SAMPLES):   # periodic pollers may be awake at any single instant
+                regs = monitor(sock, sum([['cpu %d' % c, 'info registers'] for c in range(4)], []))
+                samples.append([int(p, 16) - base for p in re.findall(r'PC=([0-9a-f]+)', regs)])
+                time.sleep(0.3)
     finally:
         proc.terminate()
         proc.wait()
@@ -86,9 +92,10 @@ def smoke(soc, ini, timeout):
     with open(uart, 'rb') as f:
         log = f.read().decode('latin-1')
     state = re.search(r'^[0-9a-f]+: (0x[0-9a-f]+)', mon, re.M)
-    pcs = [int(p, 16) - base for p in re.findall(r'PC=([0-9a-f]+)', mon)] if base else []
+    idle_cores = {c for pcs in samples if len(pcs) == 4 for c, p in enumerate(pcs) if idle[0] <= p <= idle[1]}
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
-                            os.path.join(HVM, 'logs', 'qemu-%s.log' % soc))
+                            os.path.join(HVM, 'logs', 'qemu-%s.log' % soc),
+                            os.path.join(HVM, 'logs', 'uart-%s.log' % soc))
     for v in trace['violations']:
         print('%-7s %-5s trace: %s' % (soc, ini, v))
     return [
@@ -97,10 +104,45 @@ def smoke(soc, ini, timeout):
         ('kernel banner', 'Horizon Kernel (Mesosphere)' in log),
         ('no kernel panic', 'Kernel Panic' not in log),
         ('Kernel::s_state == Initialized', bool(state) and int(state.group(1), 16) == KERNEL_STATE_INITIALIZED),
-        ('4 cores idle in WFI', len(pcs) == 4 and all(idle[0] <= p <= idle[1] for p in pcs)),
-        ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][0xC4000003] == 3),
-        ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted', not trace['violations']),
+        ('4 cores idle in WFI', idle_cores == {0, 1, 2, 3}),
+        ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
+        ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
+    ] + profile_checks(ini, trace)
+
+
+def user_smc_calls(trace):
+    """Pair user SMCs with their returns (exosphere runs them with interrupts masked, one at a time per core)."""
+    calls, last = [], {}
+    for kind, cpu, sid, regs in trace['user_smc']:
+        if kind == 'smc':
+            last[cpu] = (sid, regs)
+        elif cpu in last:
+            sid0, args = last.pop(cpu)
+            calls.append((sid0, args, regs))
+    return calls
+
+
+def pids_named(trace, name):
+    return {p for p, n in trace['procs'].items() if n == name}
+
+
+def profile_checks(ini, trace):
+    if ini == 'empty':
+        return []
+    calls = user_smc_calls(trace)
+    get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
+    sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')
+    checks = [
+        ('sm and spl started', bool(sm) and bool(spl)),
+        ('sm serves the "sm:" named port', any(p in sm and what == 'ManageNamedPort' and n == 'sm:'
+                                               for p, what, n in trace['ports'])),
+        ('spl registers %s' % ' '.join(sorted(SPL_SERVICES)),
+         SPL_SERVICES <= {n for p, n in trace['registered'] if p in spl}),
+        ('user GetConfig(65000) -> NotInitialized, GetConfig(65012) ok',
+         ('0xfde8', '0x7') in get_config and ('0xfdf4', '0x0') in get_config),
+        ('spl RNG through user GenerateRandomBytes (redacted)', any(sid == 0xC3000006 for sid, _, _ in calls)),
     ]
+    return checks
 
 
 def main():
