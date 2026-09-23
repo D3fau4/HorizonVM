@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
-# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|none] [--persist] [--user-exc]
+# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--persist] [--user-exc]
 #               [--gdb] [--trace] [-- extra qemu args]
 set -euo pipefail
 
@@ -63,6 +63,13 @@ case "$NAND" in
     # SDMMC4 eMMC (tegrax1.c: sd index 3). snapshot=on keeps the image pristine; its overlay goes to $TMPDIR.
     image) [ -f "$IMG" ] || { echo "missing $IMG (tools/mknand.py --soc $SOC --fw <FW> --image)" >&2; exit 1; }
            EXTRA+=(-drive "if=sd,index=3,format=raw,file=$IMG,snapshot=$SNAPSHOT") ;;
+    # Live from the folder tree: hvm_nbd composes and encrypts the eMMC on the fly, exits when QEMU disconnects.
+    dir) SOCK="$HVM/run/nbd-$SOC.sock"
+         rm -f "$SOCK"
+         python3 "$ROOT/tools/hvm_nbd.py" serve --soc "$SOC" --socket "$SOCK" &
+         for _ in $(seq 1 240); do [ -S "$SOCK" ] && break; sleep 0.25; done
+         [ -S "$SOCK" ] || { echo "hvm_nbd did not start" >&2; exit 1; }
+         EXTRA+=(-drive "if=sd,index=3,format=raw,file.driver=nbd,file.server.type=unix,file.server.path=$SOCK") ;;
     none) ;;
     *) echo "unknown nand backend: $NAND" >&2; exit 2 ;;
 esac

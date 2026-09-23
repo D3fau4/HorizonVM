@@ -1,6 +1,7 @@
 import hashlib
 import os
 import shutil
+import socket
 import stat
 import struct
 import subprocess
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import hvm_keys  # noqa: E402
 import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
+import hvm_nbd   # noqa: E402
 import mknand   # noqa: E402
 import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
@@ -367,6 +369,120 @@ class TestNand(unittest.TestCase):
         finally:
             hvm_nand.HVM = old
             shutil.rmtree(d)
+
+
+def make_nand_fixture(d):
+    """Temporary HORIZONVM_HOME with an erista identity and a small NAND tree."""
+    ident = os.path.join(d, 'identity', 'erista')
+    os.makedirs(ident)
+    with open(os.path.join(ident, 'bis.bin'), 'wb') as f:
+        f.write(hashlib.sha512(b'a').digest() + hashlib.sha512(b'b').digest())
+    with open(os.path.join(ident, 'ecid.json'), 'w') as f:
+        f.write('{"lot0": 1}')
+    tree = os.path.join(d, 'tree')
+    for sub in mknand.TREE_DIRS:
+        os.makedirs(os.path.join(tree, sub))
+    reg = os.path.join(tree, 'SYSTEM/Contents/registered')
+    for i in range(12):
+        with open(os.path.join(reg, '%032x.nca' % (i * 0x1111)), 'wb') as f:
+            f.write(hashlib.sha512(bytes([i])).digest() * (0x300 * (i + 1)))
+    with open(os.path.join(tree, 'SAFE', 'lowercase-long-name.txt'), 'wb') as f:
+        f.write(b'safe')
+    with open(os.path.join(tree, 'PRODINFO.bin'), 'wb') as f:
+        f.write(hvm_nand.build_blank_cal0())
+    return tree
+
+
+def nbd_client(sock):
+    """Minimal fixed-newstyle NBD client: NBD_OPT_GO, then (read, write, flush) helpers."""
+    magic, opt_magic, _ = struct.unpack('>QQH', sock.recv(18, socket.MSG_WAITALL))
+    assert (magic, opt_magic) == (hvm_nbd.NBDMAGIC, hvm_nbd.IHAVEOPT)
+    sock.sendall(struct.pack('>I', 3))
+    sock.sendall(struct.pack('>QII', hvm_nbd.IHAVEOPT, 8, 0))          # STRUCTURED_REPLY: must be refused
+    reply = struct.unpack('>QIII', sock.recv(20, socket.MSG_WAITALL))
+    assert reply[2] == hvm_nbd.REP_ERR_UNSUP
+    sock.sendall(struct.pack('>QII', hvm_nbd.IHAVEOPT, hvm_nbd.OPT_GO, 6) + struct.pack('>IH', 0, 0))
+    size = None
+    while True:
+        _, _, rtype, length = struct.unpack('>QIII', sock.recv(20, socket.MSG_WAITALL))
+        data = sock.recv(length, socket.MSG_WAITALL) if length else b''
+        if rtype == hvm_nbd.REP_INFO:
+            size = struct.unpack('>HQH', data)[1]
+        if rtype == hvm_nbd.REP_ACK:
+            break
+
+    def cmd(kind, off, length, payload=b''):
+        sock.sendall(struct.pack('>IHHQQI', hvm_nbd.REQUEST_MAGIC, 0, kind, 7, off, length) + payload)
+        magic, err, handle = struct.unpack('>IIQ', sock.recv(16, socket.MSG_WAITALL))
+        assert (magic, handle) == (hvm_nbd.SIMPLE_REPLY_MAGIC, 7)
+        return err, sock.recv(length, socket.MSG_WAITALL) if kind == hvm_nbd.CMD_READ and not err else b''
+    return size, cmd
+
+
+@unittest.skipUnless(TOOLS_AVAILABLE, 'dosfstools/mtools/gdisk not available')
+class TestNbd(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = hvm_nand.HVM
+        hvm_nand.HVM = self.d
+        self.tree = make_nand_fixture(self.d)
+        self.disk = hvm_nbd.VirtualEmmc('erista', self.tree, self.d)
+
+    def tearDown(self):
+        hvm_nand.HVM = self.old
+        shutil.rmtree(self.d)
+
+    def test_matches_image_outside_fat(self):
+        img = os.path.join(self.d, 'emmc.img')
+        mknand.build_image('erista', self.tree, img)
+        user = 2 * hvm_nand.BOOT_PART_SIZE
+        _, off, size, *_ = hvm_nand.PART['PRODINFO']
+        with open(img, 'rb') as f:
+            for start, n in ((0, 0x10000), (user, 34 * hvm_nand.LBA), (user + off, size),
+                             (hvm_nand.IMAGE_SIZE - 33 * hvm_nand.LBA, 33 * hvm_nand.LBA)):
+                f.seek(start)
+                self.assertEqual(self.disk.read(start, n), f.read(n), hex(start))
+
+    def test_fat_partitions(self):
+        key = hvm_nand.load_bis_keys('erista')[2]
+        _, off, *_ = hvm_nand.PART['SYSTEM']
+        cipher = self.disk.read(2 * hvm_nand.BOOT_PART_SIZE + off, 0x100000)
+        self.assertEqual(hvm_nand.xts(key, cipher, 0, False), self.disk.fats['SYSTEM'].read(0, 0x100000))
+        for name in ('SYSTEM', 'SAFE', 'PRODINFOF', 'USER'):
+            plain = os.path.join(self.d, name + '.fat')
+            hvm_nbd.export_partition('erista', self.tree, name, plain)
+            r = subprocess.run(['fsck.fat', '-n', plain], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, name + ': ' + r.stdout[-500:])
+            out = os.path.join(self.d, name + '.files')
+            os.makedirs(out)
+            subprocess.run(['mcopy', '-s', '-n', '-i', plain, '::/*', out], env=mknand.MTOOLS_ENV, capture_output=True)
+            want, got = mknand.tree_files(os.path.join(self.tree, name)), mknand.tree_files(out)
+            self.assertEqual(set(want), set(got), name)
+            for k in want:
+                self.assertEqual(mknand.file_hash(want[k]), mknand.file_hash(got[k]), k)
+            if name == 'SAFE':
+                self.assertIn('lowercase-long-name.txt', os.listdir(out))   # LFN keeps case and length
+
+    def test_nbd_protocol_and_overlay(self):
+        import threading
+        a, b = socket.socketpair()
+        t = threading.Thread(target=lambda: hvm_nbd.serve_connection(b, self.disk))
+        t.start()
+        size, cmd = nbd_client(a)
+        self.assertEqual(size, hvm_nand.IMAGE_SIZE)
+        err, gpt = cmd(hvm_nbd.CMD_READ, 2 * hvm_nand.BOOT_PART_SIZE + hvm_nand.LBA, 8)
+        self.assertEqual((err, gpt), (0, b'EFI PART'))
+        data = bytes(range(256)) * 6                    # unaligned write spanning three 512-byte sectors
+        self.assertEqual(cmd(hvm_nbd.CMD_WRITE, 0x10100, len(data), data)[0], 0)
+        self.assertEqual(cmd(hvm_nbd.CMD_FLUSH, 0, 0)[0], 0)
+        self.assertEqual(cmd(hvm_nbd.CMD_READ, 0x10100, len(data)), (0, data))
+        self.assertEqual(cmd(hvm_nbd.CMD_READ, 0x10000, 0x100), (0, bytes(0x100)))   # rest of the sector intact
+        self.assertEqual(cmd(hvm_nbd.CMD_READ, size - 8, 16)[0], hvm_nbd.EINVAL)
+        a.sendall(struct.pack('>IHHQQI', hvm_nbd.REQUEST_MAGIC, 0, hvm_nbd.CMD_DISC, 0, 0, 0))
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        a.close()
+        b.close()
 
 
 def tipc(cmd, name=b'', pid=False):

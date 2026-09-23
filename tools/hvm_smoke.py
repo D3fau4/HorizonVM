@@ -67,7 +67,7 @@ def monitor(sock_path, commands):
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
 
-def smoke(soc, ini, timeout):
+def smoke(soc, ini, nand, timeout):
     os.makedirs(os.path.join(HVM, 'run'), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(HVM, 'logs'), mode=0o700, exist_ok=True)
     sock = os.path.join(HVM, 'run', 'mon-%s.sock' % soc)
@@ -77,7 +77,7 @@ def smoke(soc, ini, timeout):
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini, '--trace', '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + ['--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
@@ -107,7 +107,7 @@ def smoke(soc, ini, timeout):
                             os.path.join(HVM, 'logs', 'uart-%s.log' % soc),
                             dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})))
     for v in trace['violations']:
-        print('%-7s %-5s trace: %s' % (soc, ini, v))
+        print('%-7s %-5s %-5s trace: %s' % (soc, ini, nand or '', v))
     return [
         ('exosphere OHAYO (single boot)', log.count('OHAYO') == 1),
         ('exosphere KeyGen 15', '[secmon] KeyGen: 15' in log),
@@ -212,6 +212,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--soc', action='append', choices=['erista', 'mariko'])
     ap.add_argument('--ini', help='comma-separated INI1 profiles (default: every built build/package2-<ini>.bin)')
+    ap.add_argument('--nand', help='comma-separated eMMC backends for run.sh --nand (default: run.sh default)')
     ap.add_argument('--timeout', type=int, default=180)
     args = ap.parse_args()
     os.umask(0o077)
@@ -219,11 +220,12 @@ def main():
     inis = args.ini.split(',') if args.ini else [
         i for i in PROFILES if os.path.exists(os.path.join(ROOT, 'build', 'package2-%s.bin' % i))]
     failed = False
-    for ini in inis:
-        for soc in args.soc or ['erista', 'mariko']:
-            for name, ok in smoke(soc, ini, args.timeout):
-                print('%-7s %-5s %-6s %s' % (soc, ini, 'PASS' if ok else 'FAIL', name))
-                failed |= not ok
+    for nand in args.nand.split(',') if args.nand else [None]:
+        for ini in inis:
+            for soc in args.soc or ['erista', 'mariko']:
+                for name, ok in smoke(soc, ini, nand, args.timeout):
+                    print('%-7s %-5s %-5s %-6s %s' % (soc, ini, nand or '', 'PASS' if ok else 'FAIL', name))
+                    failed |= not ok
     sys.exit(1 if failed else 0)
 
 
