@@ -17,7 +17,7 @@ HVM_FW=/path/to/firmware scripts/build.sh   # Atmosphère nx_debug + build/packa
                                      # HVM_FW: a 22.5.0 dump (Processed/, sysupdate-*/) for the ams/stock INI1
 for soc in erista mariko; do         # per-profile VM identity in ~/.horizonvm (never in the repo)
     tools/mkfuses.py --soc $soc
-    tools/hvm_keys.py --soc $soc --prod-keys /path/to/prod.keys
+    tools/hvm_keys.py --soc $soc --prod-keys /path/to/prod.keys --derive-bis
 done
 ```
 

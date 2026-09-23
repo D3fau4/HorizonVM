@@ -7,6 +7,7 @@ import secrets
 import struct
 
 # Offsets inside the fuse register block (0x7000F800), from libexosphere fuse_registers.hpp.
+FUSE_SOC_SPEEDO_1_CALIB = 0x138
 FUSE_RESERVED_ODM0 = 0x1C8
 FUSE_OPT_VENDOR_CODE = 0x200
 FUSE_OPT_FAB_CODE = 0x204
@@ -18,11 +19,14 @@ FUSE_OPT_Y_COORDINATE = 0x218
 FUSE_OPT_OPS_RESERVED = 0x220
 
 # tegra_qemu maps a secret of length L onto fuse registers [0x400 - L, 0x400) (fuse.c).
-CACHE_START = FUSE_RESERVED_ODM0
+CACHE_START = FUSE_SOC_SPEEDO_1_CALIB
 CACHE_END = 0x400
 
 NEW_FUSE_FORMAT_MAGIC = (0x8E61ECAE, 0xF2BA3BB2)   # fuse_api.cpp IsNewFuseFormat
 HARDWARE_STATE_PRODUCTION = 4                        # fuse_api.cpp GetHardwareState
+# fuse::GetPatchVersion reads SOC_SPEEDO_1_CALIB; >= Odnx02A2 (0x7F) selects the retail device-unique key paths
+# of exosphere (secmon_smc_aes.cpp GenerateSpecificAesKey), as on patched Erista units and every Mariko.
+PATCH_VERSION_ODNX02A2 = 0x7F
 
 PROFILES = {
     # raw ODM4 hardware-type value (fuse_api.cpp GetHardwareType) and a 4 GB DramId (fuse.hpp)
@@ -53,6 +57,7 @@ def encode_odm4(hw_type, hw_state, dram_id, format_version=1):
 def build_fuse_cache(profile, ecid):
     p = PROFILES[profile]
     regs = {
+        FUSE_SOC_SPEEDO_1_CALIB: PATCH_VERSION_ODNX02A2,
         FUSE_RESERVED_ODM0 + 0 * 4: NEW_FUSE_FORMAT_MAGIC[0],
         FUSE_RESERVED_ODM0 + 1 * 4: NEW_FUSE_FORMAT_MAGIC[1],
         FUSE_RESERVED_ODM0 + 4 * 4: encode_odm4(p['hw_type'], HARDWARE_STATE_PRODUCTION, p['dram_id']),

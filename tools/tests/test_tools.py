@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import stat
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import hvm_keys  # noqa: E402
 import hvm_log  # noqa: E402
 import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
@@ -141,7 +143,9 @@ class TestMkfuses(unittest.TestCase):
     def test_profiles(self):
         for soc, (name, dram) in {'erista': ('Icosa', 0), 'mariko': ('Iowa', 3)}.items():
             cache = mkfuses.build_fuse_cache(soc, self.ECID)
-            self.assertEqual(len(cache), 0x400 - 0x1C8)
+            self.assertEqual(len(cache), 0x400 - mkfuses.CACHE_START)
+            self.assertLessEqual(len(cache), 0x368)   # tegra_qemu fuse.c: largest cache it accepts
+            self.assertEqual(read_reg(cache, mkfuses.FUSE_SOC_SPEEDO_1_CALIB), 0x7F)
             self.assertEqual(self.decode(cache), (name, soc, 'Production', dram, True))
 
     def test_ecid_placement(self):
@@ -159,7 +163,8 @@ class TestMkfuses(unittest.TestCase):
 
     @unittest.skipUnless(os.path.exists(GXX), 'devkitA64 not available')
     def test_offsets_match_atmosphere(self):
-        fields = {'chip_common.FUSE_RESERVED_ODM_0': mkfuses.FUSE_RESERVED_ODM0,
+        fields = {'chip_common.FUSE_SOC_SPEEDO_1_CALIB': mkfuses.FUSE_SOC_SPEEDO_1_CALIB,
+                  'chip_common.FUSE_RESERVED_ODM_0': mkfuses.FUSE_RESERVED_ODM0,
                   'chip_common.FUSE_OPT_VENDOR_CODE': mkfuses.FUSE_OPT_VENDOR_CODE,
                   'chip_common.FUSE_OPT_FAB_CODE': mkfuses.FUSE_OPT_FAB_CODE,
                   'chip_common.FUSE_OPT_LOT_CODE_0': mkfuses.FUSE_OPT_LOT_CODE_0,
@@ -170,6 +175,7 @@ class TestMkfuses(unittest.TestCase):
                   'chip_common.FUSE_OPT_OPS_RESERVED': mkfuses.FUSE_OPT_OPS_RESERVED}
         src = '#include <exosphere.hpp>\n#include "fuse_registers.hpp"\n#include <cstddef>\n'
         src += ''.join('static_assert(offsetof(ams::fuse::FuseRegisterRegion, %s) == 0x%x);\n' % kv for kv in fields.items())
+        src += 'static_assert((ams::fuse::PatchVersion_Odnx02A2 & 0xFFF) == 0x%x);\n' % mkfuses.PATCH_VERSION_ODNX02A2
         r = compile_check(src, os.path.join(AMS, 'libraries/libexosphere/source/fuse'))
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
@@ -202,10 +208,13 @@ class TestMkexo0(unittest.TestCase):
 class TestHvmKeys(unittest.TestCase):
     MASTER = '00112233445566778899aabbccddeeff'
     KEK = 'ffeeddccbbaa99887766554433221100'
+    SOURCES = {n: hashlib.sha256(n.encode()).hexdigest()[:64 if n.startswith('bis_key_source') else 32]
+               for n in hvm_keys.BIS_SOURCES + ['master_key_00']}
 
-    def run_tool(self, soc, ident, keys):
+    def run_tool(self, soc, ident, keys, *extra):
         return subprocess.run([sys.executable, os.path.join(ROOT, 'tools/hvm_keys.py'), '--soc', soc,
-                               '--prod-keys', keys, '--identity', ident], capture_output=True, text=True, check=True)
+                               '--prod-keys', keys, '--identity', ident] + list(extra),
+                              capture_output=True, text=True, check=True)
 
     def test_profiles_and_identity(self):
         d = tempfile.mkdtemp()
@@ -213,24 +222,61 @@ class TestHvmKeys(unittest.TestCase):
             keys = os.path.join(d, 'prod.keys')
             with open(keys, 'w') as f:
                 f.write('master_key_15 = %s\nmariko_kek = %s\n' % (self.MASTER, self.KEK))
+                f.write(''.join('%s = %s\n' % kv for kv in self.SOURCES.items()))
+            secret_hex = [self.MASTER, self.KEK] + [v[:32] for v in self.SOURCES.values()]
             for soc, slots in (('erista', (10, 12, 13, 15)), ('mariko', (12, 14))):
                 ident = os.path.join(d, soc)
-                out1 = self.run_tool(soc, ident, keys)
+                out1 = self.run_tool(soc, ident, keys, '--derive-bis')
                 files = {s: os.path.join(ident, 'aeskeyslot%d.bin' % s) for s in slots}
+                files['bis'] = os.path.join(ident, 'bis.bin')
                 first = {s: read(p) for s, p in files.items()}
-                out2 = self.run_tool(soc, ident, keys)
+                out2 = self.run_tool(soc, ident, keys, '--derive-bis')
                 self.assertEqual(first, {s: read(p) for s, p in files.items()}, 'identity must persist')
                 self.assertEqual(stat.S_IMODE(os.stat(ident).st_mode), 0o700)
-                for p in files.values():
-                    self.assertEqual(os.path.getsize(p), 16)
+                for name, p in files.items():
+                    self.assertEqual(os.path.getsize(p), 128 if name == 'bis' else 16)
                     self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+                bis = first['bis']
+                self.assertEqual(bis[64:96], bis[96:128], 'SYSTEM and USER share bis_key_source_02')
+                self.assertEqual(len({bis[i:i + 16] for i in range(0, 128, 16)}), 6)   # BIS3 == BIS2
+                secret_hex += [bis[i:i + 16].hex() for i in range(0, 128, 16)]
                 for out in (out1, out2):
-                    self.assertNotIn(self.MASTER, out.stdout + out.stderr)
-                    self.assertNotIn(self.KEK, out.stdout + out.stderr)
+                    for h in secret_hex:
+                        self.assertNotIn(h, (out.stdout + out.stderr).lower())
             self.assertEqual(read(os.path.join(d, 'erista/aeskeyslot13.bin')), bytes.fromhex(self.MASTER))
             self.assertEqual(read(os.path.join(d, 'mariko/aeskeyslot12.bin')), bytes.fromhex(self.KEK))
+            self.assertNotEqual(read(os.path.join(d, 'erista/bis.bin')), read(os.path.join(d, 'mariko/bis.bin')))
         finally:
             shutil.rmtree(d)
+
+    def test_bis_derivation_chain(self):
+        """Erista BIS keys follow exosphere's GenerateSpecificAesKey / GenerateAesKek+LoadAesKey chains."""
+        src = {n: bytes.fromhex(v) for n, v in self.SOURCES.items()}
+        duk = bytes(range(16))
+        bis = hvm_keys.derive_bis_keys(duk, src)
+        d = hvm_keys.aes_dec
+        kek0 = d(duk, src['retail_specific_aes_key_source'])
+        self.assertEqual(bis[0], d(kek0, src['bis_key_source_00'][:16]) + d(kek0, src['bis_key_source_00'][16:]))
+        g = d(d(duk, src['aes_kek_generation_source']), src['bis_kek_source'])
+        kb = d(g, src['aes_key_generation_source'])
+        self.assertEqual(bis[1], d(kb, src['bis_key_source_01'][:16]) + d(kb, src['bis_key_source_01'][16:]))
+
+    @unittest.skipUnless(os.path.exists(GXX), 'devkitA64 not available')
+    def test_volatile_keys_layout(self):
+        fields = hvm_keys.parse_volatile_keys()
+        self.assertEqual([n for n, _ in hvm_keys.VOLATILE_KEYS], list(fields))
+        t = 'ams::secmon::VolatileKeys'
+        src = '#include <exosphere.hpp>\n#include <cstddef>\n'
+        src += 'static_assert(sizeof(%s) == 0x%x);\n' % (t, hvm_keys.VOLATILE_KEYS_SIZE)
+        off = 0
+        for name, size in hvm_keys.VOLATILE_KEYS:
+            if name != 'rsa_moduli':   # the three 0x100-byte moduli are separate members
+                src += 'static_assert(offsetof(%s, %s) == 0x%x);\n' % (t, name, off)
+            off += size
+        src += 'static_assert(ams::pkg1::KeyGeneration_Count == %d);\n' % hvm_keys.KEY_GENERATION_COUNT
+        src += 'static_assert(ams::pkg1::OldDeviceMasterKeyCount == %d);\n' % hvm_keys.DEVICE_MASTER_KEY_COUNT
+        r = compile_check(src)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
 
 def tipc(cmd, name=b'', pid=False):
