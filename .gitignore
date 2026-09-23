@@ -1,0 +1,10 @@
+/build/
+__pycache__/
+
+# Secrets and VM identity must never be committed (they live in ~/.horizonvm).
+*.keys
+*.key
+keys/
+identity/
+logs/
+*.log
