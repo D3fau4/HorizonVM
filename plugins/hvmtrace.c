@@ -20,7 +20,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define SVC_SEND_SYNC_REQUEST               0x21
 #define SVC_SEND_SYNC_REQUEST_WITH_USER_BUF 0x22
 #define SVC_MANAGE_NAMED_PORT               0x71
-#define SM_MSG_LOG_SIZE                     0x30
+#define SM_MSG_LOG_SIZE                     0x40
 
 static FILE *out;
 static GMutex lock;

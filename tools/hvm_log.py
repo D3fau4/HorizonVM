@@ -37,6 +37,7 @@ ALLOWED = {
     'sysctr0': 'CNTFID0 check', 'timer': 'TIMERUS/WDT/TIMER_SHARED', 'apb_misc': 'APB slave security',
     'pinmuxaux': 'UART pinmux (log_api)', 'ahb_gizmo': 'AHB arbitration security', 'actmon': 'activity monitor IRQ',
     'mselect': 'secmon_setup_warm', 'host1x': 'secmon_setup host1x security',
+    'sdmmc': 'FS eMMC driver (SDMMC4)',
 }
 
 # exosphere dispatches on the smc immediate (secmon_smc_handler.cpp): 1 = kernel table, 0 = user table.
@@ -64,10 +65,11 @@ SM_COMMANDS = {0: 'RegisterClient', 1: 'GetServiceHandle', 2: 'RegisterService',
                65100: 'AtmosphereHasService', 65101: 'AtmosphereWaitService'}
 SM_NAMED = {1, 2, 3, 65000, 65001, 65004, 65005, 65006, 65007, 65100, 65101}
 
-# Exceptions expected in normal operation: IRQs, SVCs from EL0, SMCs from the kernel and lazy-FPU traps
-# (EC 0x7, kern_exception_handlers_asm.s FpuAccessExceptionHandler).
+# Exceptions expected in normal operation: IRQs, SVCs from EL0, SMCs from the kernel, lazy-FPU traps
+# (EC 0x7, kern_exception_handlers_asm.s FpuAccessExceptionHandler) and the SE interrupt, a group 0 FIQ
+# that exosphere takes at EL3 on core 3 for asynchronous user SMCs (secmon_setup.cpp SecurityEngineInterruptId).
 EXC_ALLOWED = {('IRQ', 'EL0', 'EL1'), ('IRQ', 'EL1', 'EL1'), ('SVC', 'EL0', 'EL1'),
-               ('Secure Monitor Call', 'EL1', 'EL3')}
+               ('Secure Monitor Call', 'EL1', 'EL3'), ('FIQ', 'EL0', 'EL3'), ('FIQ', 'EL1', 'EL3')}
 EC_FP_ACCESS = 0x7
 # Kernel panics, kernel dumps of crashed user processes, svc::Break, and stratosphere aborts/asserts
 # (diag_default_abort_observer.cpp: "<reason>: '<expr>' in <func>, process=0x..").
@@ -236,15 +238,15 @@ def report(r):
     for pid in pids:
         calls = sum(n for (p, _), n in r['svc'].items() if p == pid)
         print('  %-12s pid=%-3d svc=%d' % (proc_name(r, pid), pid, calls))
-        for p, what, name in r['ports']:
-            if p == pid:
-                print('      %s(%s)' % (what, name))
+        ports = collections.Counter((what, name) for p, what, name in r['ports'] if p == pid)
+        for (what, name), n in ports.items():
+            print('      %s(%s)%s' % (what, name, ' x%d' % n if n > 1 else ''))
         regs = [n for p, n in r['registered'] if p == pid]
         if regs:
-            print('      registers: %s' % ' '.join(regs))
+            print('      registers: %s' % ' '.join(n or '?' for n in regs))
         looks = [n for p, n in r['lookups'] if p == pid]
         if looks:
-            print('      looks up:  %s' % ' '.join(sorted(set(looks))))
+            print('      looks up:  %s' % ' '.join(sorted({n or '?' for n in looks})))
         for (p, tls), (_, desc) in sorted(r['pending'].items()):
             if p == pid:
                 print('      thread tls=0x%s blocked in %s' % (tls, desc))

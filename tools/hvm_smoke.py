@@ -16,7 +16,10 @@ KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/ni
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
 PROFILES = ('empty', 'core', 'ams', 'stock')
-SETTLE = {'empty': 5, 'core': 8, 'ams': 30, 'stock': 30}     # seconds after the kernel layout is printed
+SETTLE = {'empty': 5, 'core': 8, 'ams': 15, 'stock': 30}     # seconds after the kernel layout / READY
+# Trace line that marks a profile's userland milestone (smc lines are flushed as they happen):
+# boot's SetConfig(ExosphereApiVersion) through spl, i.e. the real HOS version is known.
+READY = {'ams': r'smc_ret cpu=3 el=1 pc=0x[0-9a-f]+ imm=0 id=0xc3000401 x0=0x0 x1=0xfde8'}
 IDLE_SAMPLES = 5
 SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
@@ -77,6 +80,8 @@ def smoke(soc, ini, timeout):
     try:
         m = wait_for(uart, r'KernelRegion[^\n]*\n\s+Code\s+(0x[0-9a-f]+)', proc, timeout)
         base = int(m.group(1), 16) if m else None
+        if base is not None and ini in READY:
+            wait_for(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc), READY[ini], proc, timeout)
         time.sleep(SETTLE[ini])   # let init finish and the cores go idle
         mon, samples = '', []
         if base is not None and proc.poll() is None:
@@ -122,6 +127,22 @@ def user_smc_calls(trace):
     return calls
 
 
+def registered_by(trace, name):
+    pids = pids_named(trace, name)
+    return {n for p, n in trace['registered'] if p in pids}
+
+
+def ams_checks(trace):
+    names = set(trace['procs'].values())
+    return [
+        ('7 INI1 processes started', names == {'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl', 'FS'}),
+        ('FS drives the eMMC (SDMMC4 MMIO)', 'sdmmc' in trace['mmio']),
+        ('FS registers fsp-srv fsp-pr fsp-ldr', {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
+        ('spl registers its services', SPL_SERVICES <= registered_by(trace, 'spl')),
+        ('ncm mounted SYSTEM and its content meta DB: registers ncm lr', {'ncm', 'lr'} <= registered_by(trace, 'NCM')),
+    ]
+
+
 def pids_named(trace, name):
     return {p for p, n in trace['procs'].items() if n == name}
 
@@ -129,6 +150,8 @@ def pids_named(trace, name):
 def profile_checks(ini, trace):
     if ini == 'empty':
         return []
+    if ini == 'ams':
+        return ams_checks(trace)
     calls = user_smc_calls(trace)
     get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
     sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')
@@ -149,7 +172,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--soc', action='append', choices=['erista', 'mariko'])
     ap.add_argument('--ini', help='comma-separated INI1 profiles (default: every built build/package2-<ini>.bin)')
-    ap.add_argument('--timeout', type=int, default=60)
+    ap.add_argument('--timeout', type=int, default=180)
     args = ap.parse_args()
     os.umask(0o077)
 
