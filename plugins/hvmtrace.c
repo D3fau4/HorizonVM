@@ -240,11 +240,14 @@ static bool ipc_decode(uint64_t va, bool reply, int *kind, uint32_t *value)
     }
     if (*kind == IPC_CMIF) {
         off = (off + 15) & ~(size_t)15;
-        if (off + 12 > IPC_HEADER_READ || memcmp(m + off, reply ? "SFCO" : "SFCI", 4)) {
-            return false;
+        /* Domain messages (libstratosphere's fsp-srv, ...) put a 0x10-byte domain header before SFCI/SFCO. */
+        for (size_t dom = 0; dom <= 0x10; dom += 0x10) {
+            if (off + dom + 12 <= IPC_HEADER_READ && !memcmp(m + off + dom, reply ? "SFCO" : "SFCI", 4)) {
+                memcpy(value, m + off + dom + 8, 4);
+                return true;
+            }
         }
-        memcpy(value, m + off + 8, 4);
-        return true;
+        return false;
     }
     if (*kind == IPC_TIPC && reply && off + 4 <= IPC_HEADER_READ) {
         memcpy(value, m + off, 4);

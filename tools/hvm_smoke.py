@@ -67,7 +67,7 @@ def monitor(sock_path, commands):
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
 
-def smoke(soc, ini, nand, timeout):
+def smoke(soc, ini, nand, timeout, persist=False):
     os.makedirs(os.path.join(HVM, 'run'), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(HVM, 'logs'), mode=0o700, exist_ok=True)
     sock = os.path.join(HVM, 'run', 'mon-%s.sock' % soc)
@@ -77,7 +77,7 @@ def smoke(soc, ini, nand, timeout):
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + ['--trace', '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + (['--persist'] if persist else []) + ['--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
@@ -97,6 +97,10 @@ def smoke(soc, ini, nand, timeout):
     finally:
         proc.terminate()
         proc.wait()
+    lock = os.path.join(HVM, 'nand', soc, 'overlay', 'lock')
+    end = time.time() + 120
+    while nand == 'dir' and persist and os.path.exists(lock) and time.time() < end:
+        time.sleep(0.5)                                 # hvm_nbd writes back once QEMU has disconnected
 
     with open(uart, 'rb') as f:
         log = f.read().decode('latin-1')
@@ -117,7 +121,16 @@ def smoke(soc, ini, nand, timeout):
         ('4 cores idle in WFI', idle_cores == {0, 1, 2, 3}),
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
-    ] + profile_checks(ini, trace, log)
+    ] + profile_checks(soc, ini, trace, log) + writeback_checks(soc, ini, nand, persist)
+
+
+def writeback_checks(soc, ini, nand, persist):
+    if nand != 'dir' or not persist or ini != 'ams':
+        return []
+    saves = os.path.join(HVM, 'nand', soc, 'dir', 'SYSTEM', 'save')
+    names = set(os.listdir(saves)) if os.path.isdir(saves) else set()
+    return [('write-back: FS-created saves in the folder (SYSTEM/save/8000000000000000, 8000000000000120)',
+             {'8000000000000000', '8000000000000120'} <= names)]
 
 
 def user_smc_calls(trace):
@@ -158,13 +171,16 @@ def ams_checks(trace, log):
     ]
 
 
-def stock_checks(trace, log):
+BOOT2_MODULES = {'boot2.ProdB', 'psc', 'settings', 'usb', 'pcie', 'Bus', 'pcv'}   # KProcess names (12 chars)
+
+
+def stock_checks(trace, log, ncm_db):
     """Nintendo's own 22.5.0 INI1 on exosphere + Mesosphere + the synthetic NAND."""
     names = set(trace['procs'].values())
     boot = pids_named(trace, 'boot')
     pm = pids_named(trace, 'ProcessMana')
     return [
-        ('7 official INI1 processes started', names == {'FS', 'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl'}),
+        ('the 7 official INI1 processes started', {'FS', 'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl'} <= names),
         ('FS drives the eMMC and registers fsp-srv fsp-pr fsp-ldr',
          'sdmmc' in trace['mmio'] and {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
         ('spl, ncm, loader and pm register their services',
@@ -175,23 +191,32 @@ def stock_checks(trace, log):
          {'i2c', 'gpio', 'pwm', 'host1x_modules'} <= set(trace['mmio'])
          and any(p in boot and n == 'pm:shell' for p, n in trace['lookups'])
          and re.search(r'KProcess::Exit\(\) pid=\d+ name=boot', log) is not None),
+    ] + ([
+        ('with the ncm DB on the NAND, pm launches boot2 and it starts psc settings usb pcie Bus pcv',
+         BOOT2_MODULES <= names),
+    ] if ncm_db else [
         ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
          any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND
              for p, svc, cmd, rc in trace['ipc_failures'])),
-    ]
+    ])
 
 
 def pids_named(trace, name):
     return {p for p, n in trace['procs'].items() if n == name}
 
 
-def profile_checks(ini, trace, log):
+def ncm_db_in_tree(soc):
+    """BuiltInSystem content meta DB save, as persisted by a --persist run (images are built from the same tree)."""
+    return os.path.exists(os.path.join(HVM, 'nand', soc, 'dir', 'SYSTEM', 'save', '8000000000000120'))
+
+
+def profile_checks(soc, ini, trace, log):
     if ini == 'empty':
         return []
     if ini == 'ams':
         return ams_checks(trace, log)
     if ini == 'stock':
-        return stock_checks(trace, log)
+        return stock_checks(trace, log, ncm_db_in_tree(soc))
     calls = user_smc_calls(trace)
     get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
     sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')
@@ -213,6 +238,7 @@ def main():
     ap.add_argument('--soc', action='append', choices=['erista', 'mariko'])
     ap.add_argument('--ini', help='comma-separated INI1 profiles (default: every built build/package2-<ini>.bin)')
     ap.add_argument('--nand', help='comma-separated eMMC backends for run.sh --nand (default: run.sh default)')
+    ap.add_argument('--persist', action='store_true', help='keep eMMC writes (run.sh --persist)')
     ap.add_argument('--timeout', type=int, default=180)
     args = ap.parse_args()
     os.umask(0o077)
@@ -223,7 +249,7 @@ def main():
     for nand in args.nand.split(',') if args.nand else [None]:
         for ini in inis:
             for soc in args.soc or ['erista', 'mariko']:
-                for name, ok in smoke(soc, ini, nand, args.timeout):
+                for name, ok in smoke(soc, ini, nand, args.timeout, args.persist):
                     print('%-7s %-5s %-5s %-6s %s' % (soc, ini, nand or '', 'PASS' if ok else 'FAIL', name))
                     failed |= not ok
     sys.exit(1 if failed else 0)

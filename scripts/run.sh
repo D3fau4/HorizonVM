@@ -66,7 +66,8 @@ case "$NAND" in
     # Live from the folder tree: hvm_nbd composes and encrypts the eMMC on the fly, exits when QEMU disconnects.
     dir) SOCK="$HVM/run/nbd-$SOC.sock"
          rm -f "$SOCK"
-         python3 "$ROOT/tools/hvm_nbd.py" serve --soc "$SOC" --socket "$SOCK" &
+         NBD_ARGS=(); [ "$SNAPSHOT" = off ] && NBD_ARGS=(--persist)
+         python3 "$ROOT/tools/hvm_nbd.py" serve --soc "$SOC" --socket "$SOCK" "${NBD_ARGS[@]}" &
          for _ in $(seq 1 240); do [ -S "$SOCK" ] && break; sleep 0.25; done
          [ -S "$SOCK" ] || { echo "hvm_nbd did not start" >&2; exit 1; }
          EXTRA+=(-drive "if=sd,index=3,format=raw,file.driver=nbd,file.server.type=unix,file.server.path=$SOCK") ;;

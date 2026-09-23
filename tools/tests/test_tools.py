@@ -485,6 +485,119 @@ class TestNbd(unittest.TestCase):
         b.close()
 
 
+def guest_edit(disk, name, work, edit):
+    """Apply a FAT edit made with mtools on a plaintext copy as encrypted guest writes to the virtual disk."""
+    start, size, key = disk.partition(name)
+    read, _ = disk.plain_reader(name)
+    before = read(0, size)
+    img = os.path.join(work, name + '.edit')
+    with open(img, 'wb') as f:
+        f.write(before)
+    edit(img)
+    with open(img, 'rb') as f:
+        after = f.read()
+    for unit in range(0, size, hvm_nand.XTS_SECTOR):
+        old, new = before[unit:unit + hvm_nand.XTS_SECTOR], after[unit:unit + hvm_nand.XTS_SECTOR]
+        if old == new:
+            continue
+        cipher = hvm_nand.xts(key, new, unit // hvm_nand.XTS_SECTOR, True)
+        for sec in range(0, len(new), hvm_nand.LBA):
+            if old[sec:sec + hvm_nand.LBA] != new[sec:sec + hvm_nand.LBA]:
+                disk.write(start + unit + sec, cipher[sec:sec + hvm_nand.LBA])
+    return img
+
+
+def mtools(img, *cmds):
+    for c in cmds:
+        subprocess.run([c[0], '-i', img] + list(c[1:]), env=mknand.MTOOLS_ENV, check=True, capture_output=True)
+
+
+@unittest.skipUnless(TOOLS_AVAILABLE, 'dosfstools/mtools/gdisk not available')
+class TestNbdWriteBack(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = hvm_nand.HVM
+        hvm_nand.HVM = self.d
+        self.tree = make_nand_fixture(self.d)
+        os.makedirs(os.path.join(self.tree, 'SAFE', 'olddir'))
+        for n, data in (('keep.bin', b'k' * 3000), ('grow.bin', b'g' * 700), ('trunc.bin', b't' * 5000),
+                        ('gone.bin', b'x' * 10), ('Rename Me.txt', b'r' * 100), ('olddir/inner.txt', b'i')):
+            with open(os.path.join(self.tree, 'SAFE', n), 'wb') as f:
+                f.write(data)
+        self.new = os.path.join(self.d, 'new')
+        os.makedirs(self.new)
+        for n, data in (('grow.bin', b'G' * 90000), ('trunc.bin', b'T' * 10), ('created.dat', b'c' * 20000)):
+            with open(os.path.join(self.new, n), 'wb') as f:
+                f.write(data)
+
+    def tearDown(self):
+        hvm_nand.HVM = self.old
+        shutil.rmtree(self.d)
+
+    def disk(self):
+        return hvm_nbd.open_disk('erista', self.tree, self.d, True)
+
+    def edit_safe(self, img):
+        n = self.new
+        mtools(img, ('mcopy', '-o', os.path.join(n, 'grow.bin'), '::/grow.bin'),
+               ('mcopy', '-o', os.path.join(n, 'trunc.bin'), '::/trunc.bin'),
+               ('mcopy', os.path.join(n, 'created.dat'), '::/created.dat'),
+               ('mdel', '::/gone.bin'), ('mren', '::/Rename Me.txt', '::/renamed.txt'),
+               ('mdeltree', '::/olddir'), ('mmd', '::/Newdir'), ('mmd', '::/Newdir/sub'),
+               ('mcopy', os.path.join(n, 'trunc.bin'), '::/Newdir/sub/deep.bin'))
+
+    def expected_safe(self, img):
+        out = os.path.join(self.d, 'expected')
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        subprocess.run(['mcopy', '-s', '-n', '-i', img, '::/*', out], env=mknand.MTOOLS_ENV, capture_output=True)
+        return out
+
+    def assertSameTree(self, a, b):
+        fa, fb = mknand.tree_files(a), mknand.tree_files(b)
+        self.assertEqual(set(fa), set(fb))
+        for k in fa:
+            self.assertEqual(mknand.file_hash(fa[k]), mknand.file_hash(fb[k]), k)
+        dirs = lambda r: {os.path.relpath(os.path.join(p, x), r) for p, ds, _ in os.walk(r) for x in ds}
+        self.assertEqual(dirs(a), dirs(b))
+
+    def test_write_back_in_place(self):
+        disk = self.disk()
+        img = guest_edit(disk, 'SAFE', self.d, self.edit_safe)
+        img12 = guest_edit(disk, 'PRODINFOF', self.d, lambda i: mtools(i, ('mcopy', os.path.join(self.new, 'grow.bin'), '::/cal.bin')))
+        keep = os.stat(os.path.join(self.tree, 'SAFE', 'keep.bin'))
+        stats = hvm_nbd.reconcile(disk)
+        self.assertSameTree(os.path.join(self.tree, 'SAFE'), self.expected_safe(img))
+        self.assertSameTree(os.path.join(self.tree, 'PRODINFOF'), self.expected_safe(img12))
+        self.assertEqual(os.stat(os.path.join(self.tree, 'SAFE', 'keep.bin')).st_ino, keep.st_ino)   # untouched
+        self.assertEqual(stats['files written'], 6)     # grow, trunc, created, renamed, deep, cal
+        disk.overlay.clear()
+        self.assertFalse(self.disk().overlay)
+        self.assertEqual(hvm_nbd.reconcile(self.disk()), {})   # the tree now is what the guest wrote
+
+    def test_snapshot_and_host_change(self):
+        disk = self.disk()
+        img = guest_edit(disk, 'SAFE', self.d, self.edit_safe)
+        before = mknand.tree_files(os.path.join(self.tree, 'SAFE'))
+        snap = os.path.join(self.d, 'snap')
+        hvm_nbd.reconcile(disk, snap)
+        self.assertSameTree(os.path.join(snap, 'SAFE'), self.expected_safe(img))
+        self.assertSameTree(os.path.join(snap, 'SYSTEM'), os.path.join(self.tree, 'SYSTEM'))
+        self.assertEqual(mknand.tree_files(os.path.join(self.tree, 'SAFE')), before)   # served tree untouched
+        with open(os.path.join(self.tree, 'SAFE', 'keep.bin'), 'ab') as f:
+            f.write(b'host')
+        with self.assertRaises(hvm_nbd.HostChanged):
+            hvm_nbd.reconcile(disk)
+
+    def test_overlay_persists(self):
+        disk = self.disk()
+        disk.write(0x1000, b'\x5a' * 700)
+        disk.flush()
+        again = self.disk()
+        self.assertEqual(again.read(0x1000, 700), b'\x5a' * 700)
+        self.assertEqual(again.overlay.sectors(), [8, 9])
+
+
 def tipc(cmd, name=b'', pid=False):
     """A tipc request as it sits in TLS (sm_msg dump)."""
     words = [16 + cmd, (1 << 31) if pid else 0]

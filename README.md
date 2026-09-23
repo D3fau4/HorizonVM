@@ -29,6 +29,8 @@ scripts/run.sh --soc erista          # UART-A + QEMU monitor on stdio (Ctrl-A c)
 scripts/run.sh --ini core            # INI1 profile: empty | core (sm, spl) | ams (+ pm, loader, ncm, boot, FS) | stock
 scripts/run.sh --persist             # keep eMMC writes (default: snapshot, the image stays pristine)
 scripts/run.sh --nand dir            # eMMC served live from ~/.horizonvm/nand/<soc>/dir over NBD (tools/hvm_nbd.py)
+scripts/run.sh --nand dir --persist  # ... and write the guest's changes back into those folders when QEMU exits
+tools/hvm_nbd.py sync --soc erista --to /tmp/snap   # snapshot folders + pending writes (safe while running)
 scripts/run.sh --soc erista --gdb    # then: gdb-multiarch -x gdb/horizonvm.gdb -ex hvm-trace
 scripts/run.sh --soc erista --trace  # + hvmtrace plugin: SMC/MMIO log (secrets redacted at the source)
 tools/hvm_log.py --soc erista        # summarize/check SMC, MMIO per device, exceptions
