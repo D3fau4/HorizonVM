@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Serve a HorizonVM eMMC live from its per-partition folder tree over NBD (QEMU -drive ...,file.driver=nbd).
+"""Serve a HorizonVM eMMC or SD card live from its folder tree over NBD (QEMU -drive ...,file.driver=nbd).
 
-The disk is composed on the fly: BOOT0/1 and binary partitions from their .bin files, the GPT from hvm_nand, and
+The eMMC is composed on the fly: BOOT0/1 and binary partitions from their .bin files, the GPT from hvm_nand, and
 each FAT partition synthesized from its folder (geometry and boot sector from mkfs.fat, FATs and directories
 generated in memory, file data read from the host files), AES-XTS encrypted with the VM's BIS keys.
-Guest writes go to an overlay: in memory (discarded), or with --persist to ~/.horizonvm/nand/<soc>/overlay, which is
+The SD card is an MBR plus one plaintext FAT32 volume synthesized the same way from its folder.
+Guest writes go to an overlay: in memory (discarded), or with --persist to <disk root>/overlay, which is
 reconciled back into the folders when QEMU disconnects (or by `sync`). The folders must not change while serving.
 """
 import argparse
@@ -23,8 +24,6 @@ import time
 
 import hvm_nand as nand
 
-FAT_OPTS = {'PRODINFOF': ['-F', '12'], 'SAFE': ['-F', '32', '-s', '1'],
-            'SYSTEM': ['-F', '32', '-s', '32'], 'USER': ['-F', '32', '-s', '32']}   # = mknand
 SHORT_CHARS = set(b'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$%\'-_@~`!(){}^#&')
 
 
@@ -93,7 +92,7 @@ class FatSynth:
         tmpl = os.path.join(tmp_dir, name + '.tmpl')
         with open(tmpl, 'wb') as f:
             f.truncate(size)
-        subprocess.run(['mkfs.fat', '--invariant', '-S', '512', '-n', name[:11]] + FAT_OPTS[name] + [tmpl],
+        subprocess.run(['mkfs.fat', '--invariant', '-S', '512', '-n', name[:11]] + nand.FAT_OPTS[name] + [tmpl],
                        check=True, stdout=subprocess.DEVNULL)
         with open(tmpl, 'rb') as f:
             bpb = f.read(512)
@@ -267,14 +266,14 @@ class FatSynth:
 class Overlay:
     """512-byte sectors written by the guest, as written (ciphertext). In memory, or a sparse image + sector map."""
 
-    def __init__(self, directory=None):
-        self.dir, self.mem, self.written = directory, {}, set()
+    def __init__(self, directory=None, size=nand.IMAGE_SIZE):
+        self.dir, self.size, self.mem, self.written = directory, size, {}, set()
         if directory:
             os.makedirs(directory, mode=0o700, exist_ok=True)
             img, smap = os.path.join(directory, 'overlay.img'), os.path.join(directory, 'overlay.map')
             if not os.path.exists(img):
                 with open(img, 'wb') as f:
-                    f.truncate(nand.IMAGE_SIZE)
+                    f.truncate(size)
             if os.path.exists(smap):
                 with open(smap, 'rb') as f:
                     raw = f.read()
@@ -319,34 +318,20 @@ class Overlay:
             self.map.close()
             for n in ('overlay.img', 'overlay.map'):
                 os.unlink(os.path.join(self.dir, n))
-            self.__init__(self.dir)
+            self.__init__(self.dir, self.size)
 
 
 # ------------------------------------------------------------------------------------------------ the disk --
 
-class VirtualEmmc:
-    """BOOT0 + BOOT1 + user area (GPT + NX partitions) composed from the folder tree, as tegra_qemu expects."""
+class VirtualDisk:
+    """A disk made of regions (start, length, plaintext reader, bis key or None) plus the guest's overlay.
+    `parts` maps each partition name to (disk offset, size, bis key or None, filesystem, folder in the tree)."""
 
-    def __init__(self, soc, tree, tmp_dir, overlay=None):
-        self.tree, self.keys = tree, nand.load_bis_keys(soc)
-        self.size = nand.IMAGE_SIZE
-        user = 2 * nand.BOOT_PART_SIZE
-        primary, backup = nand.build_gpt(*nand.disk_guids(soc))
-        self.regions = []                               # (start, length, reader, bis key or None)
-        for i, boot in enumerate(('BOOT0.bin', 'BOOT1.bin')):
-            self.regions.append((i * nand.BOOT_PART_SIZE, nand.BOOT_PART_SIZE, self._blob(os.path.join(tree, boot)), None))
-        self.regions.append((user, len(primary), self._bytes(primary), None))
-        self.regions.append((user + nand.USER_AREA_SIZE - len(backup), len(backup), self._bytes(backup), None))
+    def __init__(self, tree, size, regions, parts, overlay=None):
+        self.tree, self.size, self.parts = tree, size, parts
+        self.regions = sorted(regions, key=lambda r: r[0])
         self.fats = {}
-        for name, off, size, _, bis, fs in nand.PARTITIONS:
-            if fs:
-                self.fats[name] = FatSynth(name, os.path.join(tree, name), size, tmp_dir)
-                reader = self.fats[name].read
-            else:
-                reader = self._blob(os.path.join(tree, name + '.bin'))
-            self.regions.append((user + off, size, reader, None if bis is None else self.keys[bis]))
-        self.regions.sort(key=lambda r: r[0])
-        self.overlay = overlay if overlay is not None else Overlay()
+        self.overlay = overlay if overlay is not None else Overlay(size=size)
 
     @staticmethod
     def _bytes(data):
@@ -396,11 +381,8 @@ class VirtualEmmc:
         self.overlay.flush()
 
     def partition(self, name):
-        """(image offset, size, bis key or None) of a partition, BOOT0 and BOOT1 included."""
-        if name in ('BOOT0', 'BOOT1'):
-            return (name == 'BOOT1') * nand.BOOT_PART_SIZE, nand.BOOT_PART_SIZE, None
-        _, off, size, _, bis, _ = nand.PART[name]
-        return 2 * nand.BOOT_PART_SIZE + off, size, None if bis is None else self.keys[bis]
+        """(disk offset, size, bis key or None) of a partition."""
+        return self.parts[name][:3]
 
     def plain_reader(self, name):
         """Plaintext of a partition as the guest sees it now (synthesized content + its writes)."""
@@ -425,6 +407,45 @@ class VirtualEmmc:
             skip = off - off // nand.XTS_SECTOR * nand.XTS_SECTOR
             return bytes(out[skip:skip + n])
         return read, written
+
+
+class VirtualEmmc(VirtualDisk):
+    """BOOT0 + BOOT1 + user area (GPT + NX partitions) composed from the folder tree, as tegra_qemu expects."""
+
+    def __init__(self, soc, tree, tmp_dir, overlay=None):
+        keys = nand.load_bis_keys(soc)
+        user = 2 * nand.BOOT_PART_SIZE
+        primary, backup = nand.build_gpt(*nand.disk_guids(soc))
+        regions, parts, fats = [], {}, {}
+        for i, boot in enumerate(('BOOT0', 'BOOT1')):
+            regions.append((i * nand.BOOT_PART_SIZE, nand.BOOT_PART_SIZE, self._blob(os.path.join(tree, boot + '.bin')), None))
+            parts[boot] = (i * nand.BOOT_PART_SIZE, nand.BOOT_PART_SIZE, None, None, None)
+        regions.append((user, len(primary), self._bytes(primary), None))
+        regions.append((user + nand.USER_AREA_SIZE - len(backup), len(backup), self._bytes(backup), None))
+        for name, off, size, _, bis, fs in nand.PARTITIONS:
+            key = None if bis is None else keys[bis]
+            if fs:
+                fats[name] = FatSynth(name, os.path.join(tree, name), size, tmp_dir)
+                reader = fats[name].read
+            else:
+                reader = self._blob(os.path.join(tree, name + '.bin'))
+            regions.append((user + off, size, reader, key))
+            parts[name] = (user + off, size, key, fs, name if fs else None)
+        super().__init__(tree, nand.IMAGE_SIZE, regions, parts, overlay)
+        self.keys, self.fats = keys, fats
+
+
+class VirtualSd(VirtualDisk):
+    """MBR + one FAT32 volume synthesized from the folder (the card's root), unencrypted."""
+
+    def __init__(self, soc, tree, tmp_dir, overlay=None, size=None):
+        size = size or nand.sd_size(soc)
+        vol = size - nand.SD_PART_OFFSET
+        synth = FatSynth('SD', tree, vol, tmp_dir)
+        regions = [(0, nand.LBA, self._bytes(nand.build_mbr(size, nand.sd_disk_id(soc))), None),
+                   (nand.SD_PART_OFFSET, vol, synth.read, None)]
+        super().__init__(tree, size, regions, {'SD': (nand.SD_PART_OFFSET, vol, None, 'fat32', '')}, overlay)
+        self.fats = {'SD': synth}
 
 
 # -------------------------------------------------------------------------------------------------- NBD --
@@ -644,8 +665,7 @@ def reconcile(disk, dest=None):
     if in_place:
         check_host_unchanged(disk)
     os.makedirs(root, mode=0o700, exist_ok=True)
-    for name, size, fs in [('BOOT0', nand.BOOT_PART_SIZE, None), ('BOOT1', nand.BOOT_PART_SIZE, None)] + \
-            [(p[0], p[2], p[5]) for p in nand.PARTITIONS]:
+    for name, (start, size, _, fs, folder) in disk.parts.items():
         read, written = disk.plain_reader(name)
         if not fs:
             src = os.path.join(disk.tree, name + '.bin')
@@ -655,7 +675,6 @@ def reconcile(disk, dest=None):
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(root, name + '.bin'))
                 continue
-            start = disk.partition(name)[0]
             orig = os.path.getsize(src) if os.path.exists(src) else 0
             end = max(orig, (max(written) + 1) * nand.LBA - start)
             with open(os.path.join(root, name + '.bin') + '.hvm-tmp', 'wb') as f:
@@ -663,11 +682,10 @@ def reconcile(disk, dest=None):
             os.replace(os.path.join(root, name + '.bin') + '.hvm-tmp', os.path.join(root, name + '.bin'))
             stats['binary partitions'] += 1
             continue
-        synth, target = disk.fats[name], os.path.join(root, name)
+        synth, target = disk.fats[name], os.path.join(root, folder)
         if in_place and not written:
             continue
         vol = FatVolume(read)
-        start = disk.partition(name)[0]
         dirty = {2 + ((s * nand.LBA - start) - vol.data_start) // vol.cs for s in written
                  if s * nand.LBA - start >= vol.data_start}
         base, fat = base_nodes(synth), vol.walk()
@@ -716,14 +734,25 @@ def pid_alive(pid):
     return True
 
 
-def open_disk(soc, tree, tmp, persist):
-    overlay = Overlay(os.path.join(nand.soc_paths(soc)['nand'], 'overlay')) if persist else None
+def disk_root(kind, soc):
+    return nand.sd_paths(soc)['sd'] if kind == 'sd' else nand.soc_paths(soc)['nand']
+
+
+def default_tree(kind, soc):
+    return nand.sd_paths(soc)['dir'] if kind == 'sd' else nand.soc_paths(soc)['dir']
+
+
+def open_disk(soc, tree, tmp, persist, kind='emmc'):
+    size = nand.sd_size(soc) if kind == 'sd' else nand.IMAGE_SIZE
+    overlay = Overlay(os.path.join(disk_root(kind, soc), 'overlay'), size) if persist else None
+    if kind == 'sd':
+        return VirtualSd(soc, tree, tmp, overlay, size)
     return VirtualEmmc(soc, tree, tmp, overlay)
 
 
-def sync(soc, tree, dest=None, log=print):
+def sync(soc, tree, dest=None, log=print, kind='emmc'):
     """Write the persistent overlay back into the tree (and clear it), or snapshot tree + overlay into `dest`."""
-    lock = os.path.join(nand.soc_paths(soc)['nand'], 'overlay', 'lock')
+    lock = os.path.join(disk_root(kind, soc), 'overlay', 'lock')
     if dest is None and os.path.exists(lock):
         with open(lock) as f:
             pid = int(f.read() or 0)
@@ -732,7 +761,7 @@ def sync(soc, tree, dest=None, log=print):
     tmp_root = os.path.join(nand.HVM, 'tmp')
     os.makedirs(tmp_root, mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=tmp_root) as tmp:
-        disk = open_disk(soc, tree, tmp, True)
+        disk = open_disk(soc, tree, tmp, True, kind)
     if dest is not None:
         os.makedirs(dest, mode=0o700, exist_ok=True)
     stats = reconcile(disk, dest)
@@ -742,27 +771,27 @@ def sync(soc, tree, dest=None, log=print):
     return stats
 
 
-def serve(soc, tree, sock_path, accept_timeout=120, persist=False):
+def serve(soc, tree, sock_path, accept_timeout=120, persist=False, kind='emmc'):
     tmp_root = os.path.join(nand.HVM, 'tmp')
     os.makedirs(tmp_root, mode=0o700, exist_ok=True)
-    lock = os.path.join(nand.soc_paths(soc)['nand'], 'overlay', 'lock')
+    lock = os.path.join(disk_root(kind, soc), 'overlay', 'lock')
     if persist:
         os.makedirs(os.path.dirname(lock), mode=0o700, exist_ok=True)
         smap = os.path.join(os.path.dirname(lock), 'overlay.map')
         if os.path.exists(smap) and os.path.getsize(smap):
-            sync(soc, tree, log=lambda m: print(m, file=sys.stderr))   # leftover writes of an interrupted session
+            sync(soc, tree, log=lambda m: print(m, file=sys.stderr), kind=kind)   # leftovers of an interrupted session
         with open(lock, 'w') as f:
             f.write(str(os.getpid()))
     try:
-        return serve_disk(soc, tree, sock_path, accept_timeout, persist, tmp_root)
+        return serve_disk(soc, tree, sock_path, accept_timeout, persist, tmp_root, kind)
     finally:
         if persist and os.path.exists(lock):
             os.unlink(lock)
 
 
-def serve_disk(soc, tree, sock_path, accept_timeout, persist, tmp_root):
+def serve_disk(soc, tree, sock_path, accept_timeout, persist, tmp_root, kind='emmc'):
     with tempfile.TemporaryDirectory(dir=tmp_root) as tmp:
-        disk = open_disk(soc, tree, tmp, persist)
+        disk = open_disk(soc, tree, tmp, persist, kind)
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     srv = socket.socket(socket.AF_UNIX)
@@ -795,11 +824,14 @@ def serve_disk(soc, tree, sock_path, accept_timeout, persist, tmp_root):
 
 
 def export_partition(soc, tree, name, out):
-    """Write the synthesized plaintext of one FAT partition to a sparse file (free clusters stay holes)."""
+    """Write the synthesized plaintext of one FAT partition (or the SD volume) to a sparse file (holes stay holes)."""
     tmp_root = os.path.join(nand.HVM, 'tmp')
     os.makedirs(tmp_root, mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=tmp_root) as tmp:
-        synth = FatSynth(name, os.path.join(tree, name), nand.PART[name][2], tmp)
+        if name == 'SD':
+            synth = FatSynth(name, tree, nand.sd_size(soc) - nand.SD_PART_OFFSET, tmp)
+        else:
+            synth = FatSynth(name, os.path.join(tree, name), nand.PART[name][2], tmp)
     with open(out, 'wb') as f:
         f.truncate(synth.size)
         for s, e in synth.used_ranges():
@@ -818,18 +850,20 @@ def main():
     y = sub.add_parser('sync', help='write a leftover overlay back to the folders, or --to DIR for a snapshot')
     y.add_argument('--to', help='snapshot folders + guest writes into DIR (works while the server runs)')
     e = sub.add_parser('export', help='write the synthesized plaintext of a FAT partition (for fsck/mtools)')
-    e.add_argument('--part', required=True, choices=[p[0] for p in nand.PARTITIONS if p[5]])
+    e.add_argument('--part', required=True, choices=[p[0] for p in nand.PARTITIONS if p[5]] + ['SD'])
     e.add_argument('-o', '--output', required=True)
     for p in (s, e, y):
         p.add_argument('--soc', required=True, choices=['erista', 'mariko'])
-        p.add_argument('--tree', help='folder tree (default ~/.horizonvm/nand/<soc>/dir)')
+        p.add_argument('--disk', choices=['emmc', 'sd'], default='emmc')
+        p.add_argument('--tree', help='folder tree (default ~/.horizonvm/{nand,sd}/<soc>/dir)')
     args = ap.parse_args()
     os.umask(0o077)
-    tree = args.tree or nand.soc_paths(args.soc)['dir']
+    kind = 'sd' if args.cmd == 'export' and args.part == 'SD' else args.disk
+    tree = args.tree or default_tree(kind, args.soc)
     if args.cmd == 'serve':
-        serve(args.soc, tree, args.socket, persist=args.persist)
+        serve(args.soc, tree, args.socket, persist=args.persist, kind=kind)
     elif args.cmd == 'sync':
-        sync(args.soc, tree, args.to)
+        sync(args.soc, tree, args.to, kind=kind)
     else:
         export_partition(args.soc, tree, args.part, args.output)
 

@@ -15,6 +15,7 @@ import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
 import hvm_nbd   # noqa: E402
 import mknand   # noqa: E402
+import mksd     # noqa: E402
 import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
 import mkpkg2   # noqa: E402
@@ -500,7 +501,7 @@ def guest_edit(disk, name, work, edit):
         old, new = before[unit:unit + hvm_nand.XTS_SECTOR], after[unit:unit + hvm_nand.XTS_SECTOR]
         if old == new:
             continue
-        cipher = hvm_nand.xts(key, new, unit // hvm_nand.XTS_SECTOR, True)
+        cipher = new if key is None else hvm_nand.xts(key, new, unit // hvm_nand.XTS_SECTOR, True)
         for sec in range(0, len(new), hvm_nand.LBA):
             if old[sec:sec + hvm_nand.LBA] != new[sec:sec + hvm_nand.LBA]:
                 disk.write(start + unit + sec, cipher[sec:sec + hvm_nand.LBA])
@@ -596,6 +597,70 @@ class TestNbdWriteBack(unittest.TestCase):
         again = self.disk()
         self.assertEqual(again.read(0x1000, 700), b'\x5a' * 700)
         self.assertEqual(again.overlay.sectors(), [8, 9])
+
+
+@unittest.skipUnless(TOOLS_AVAILABLE, 'dosfstools/mtools/gdisk not available')
+class TestSd(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = hvm_nand.HVM
+        hvm_nand.HVM = self.d
+        make_nand_fixture(self.d)                       # identity (disk id)
+        paths = hvm_nand.sd_paths('erista')
+        os.makedirs(paths['sd'])
+        with open(paths['config'], 'w') as f:
+            f.write('{"size": %d}' % (4 << 30))
+        self.tree = paths['dir']
+        rel = ['atmosphere/package3', 'atmosphere/stratosphere.romfs',
+               'atmosphere/config_templates/system_settings.ini', 'atmosphere/contents/0100000000000008/exefs.nsp']
+        for i, r in enumerate(rel):
+            os.makedirs(os.path.join(self.tree, os.path.dirname(r)), exist_ok=True)
+            with open(os.path.join(self.tree, r), 'wb') as f:
+                f.write(hashlib.sha512(r.encode()).digest() * (0x100 * (i + 1)))
+        self.img = paths['image']
+
+    def tearDown(self):
+        hvm_nand.HVM = self.old
+        shutil.rmtree(self.d)
+
+    def test_image_and_synthesized_disk_agree(self):
+        mksd.build_image('erista', self.tree, self.img)
+        self.assertEqual(mksd.verify('erista', self.tree, self.img), [])
+        disk = hvm_nbd.open_disk('erista', self.tree, self.d, False, 'sd')
+        self.assertEqual(disk.size, 4 << 30)
+        mbr = disk.read(0, hvm_nand.LBA)
+        self.assertEqual(mbr[450], 0x0C)
+        self.assertEqual(struct.unpack_from('<II', mbr, 454), (hvm_nand.SD_PART_OFFSET // hvm_nand.LBA,
+                                                               ((4 << 30) - hvm_nand.SD_PART_OFFSET) // hvm_nand.LBA))
+        vol = os.path.join(self.d, 'sd.fat')
+        hvm_nbd.export_partition('erista', self.tree, 'SD', vol)
+        r = subprocess.run(['fsck.fat', '-n', vol], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout[-500:])
+        with open(self.img, 'rb') as f:
+            self.assertEqual(f.read(hvm_nand.LBA), mbr)
+            f.seek(hvm_nand.SD_PART_OFFSET)
+            self.assertEqual(f.read(0x5A), disk.read(hvm_nand.SD_PART_OFFSET, 0x5A))   # same mkfs.fat geometry
+
+    def test_write_back(self):
+        with open(hvm_nand.sd_paths('erista')['config'], 'w') as f:
+            f.write('{"size": %d}' % (64 << 20))       # small card: guest_edit works on a full plaintext copy
+        opts = hvm_nand.FAT_OPTS['SD']
+        hvm_nand.FAT_OPTS['SD'] = ['-F', '32', '-s', '1']
+        self.addCleanup(hvm_nand.FAT_OPTS.__setitem__, 'SD', opts)
+        disk = hvm_nbd.open_disk('erista', self.tree, self.d, True, 'sd')
+        new = os.path.join(self.d, 'backup.bin')
+        with open(new, 'wb') as f:
+            f.write(b'b' * 70000)
+        img = guest_edit(disk, 'SD', self.d, lambda i: mtools(
+            i, ('mmd', '::/atmosphere/automatic_backups'),
+            ('mcopy', new, '::/atmosphere/automatic_backups/BLANK_PRODINFO.bin'),
+            ('mdel', '::/atmosphere/package3')))
+        stats = hvm_nbd.reconcile(disk)
+        self.assertEqual(stats['files written'], 1)
+        want = mknand.tree_files(TestNbdWriteBack.expected_safe(self, img))
+        self.assertEqual(set(mknand.tree_files(self.tree)), set(want))
+        self.assertFalse(os.path.exists(os.path.join(self.tree, 'atmosphere/package3')))
+        disk.overlay.clear()
 
 
 def tipc(cmd, name=b'', pid=False):

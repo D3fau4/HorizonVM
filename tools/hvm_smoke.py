@@ -97,9 +97,9 @@ def smoke(soc, ini, nand, timeout, persist=False):
     finally:
         proc.terminate()
         proc.wait()
-    lock = os.path.join(HVM, 'nand', soc, 'overlay', 'lock')
+    locks = [os.path.join(HVM, d, soc, 'overlay', 'lock') for d in ('nand', 'sd')]
     end = time.time() + 120
-    while nand == 'dir' and persist and os.path.exists(lock) and time.time() < end:
+    while nand == 'dir' and persist and any(map(os.path.exists, locks)) and time.time() < end:
         time.sleep(0.5)                                 # hvm_nbd writes back once QEMU has disconnected
 
     with open(uart, 'rb') as f:

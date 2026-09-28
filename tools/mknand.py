@@ -13,8 +13,6 @@ import tempfile
 
 import hvm_nand as nand
 
-FAT_OPTS = {'PRODINFOF': ['-F', '12'], 'SAFE': ['-F', '32', '-s', '1'],
-            'SYSTEM': ['-F', '32', '-s', '32'], 'USER': ['-F', '32', '-s', '32']}   # 16 KiB clusters
 TREE_DIRS = ['PRODINFOF', 'SAFE', 'SYSTEM/Contents/registered', 'SYSTEM/Contents/placehld', 'SYSTEM/save',
              'SYSTEM/saveMeta', 'USER/Contents/registered', 'USER/Contents/placehld', 'USER/save',
              'USER/saveMeta', 'USER/temp']
@@ -66,12 +64,12 @@ def fat_metadata_end(plain):
     return (reserved + nfats * fat_size) * bps + root_entries * 32 + spc * bps
 
 
-def make_fat(name, src_dir, tmp):
-    _, _, size, _, _, _ = nand.PART[name]
+def make_fat(name, src_dir, tmp, size=None):
+    size = size or nand.PART[name][2]
     plain = os.path.join(tmp, name + '.fat')
     with open(plain, 'wb') as f:
         f.truncate(size)
-    subprocess.run(['mkfs.fat', '--invariant', '-S', '512', '-n', name[:11]] + FAT_OPTS[name] + [plain],
+    subprocess.run(['mkfs.fat', '--invariant', '-S', '512', '-n', name[:11]] + nand.FAT_OPTS[name] + [plain],
                    check=True, stdout=subprocess.DEVNULL)
     entries = sorted(os.listdir(src_dir)) if os.path.isdir(src_dir) else []
     if entries:

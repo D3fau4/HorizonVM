@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
-# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--persist] [--user-exc]
-#               [--gdb] [--trace] [-- extra qemu args]
+# usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--sd image|dir|none]
+#               [--persist] [--user-exc] [--gdb] [--trace] [-- extra qemu args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,6 +11,7 @@ AMS="$ROOT/third_party/Atmosphere"
 SOC=erista
 INI=
 NAND=
+SD=
 SNAPSHOT=on
 EXO0_ARGS=()
 GDB=()
@@ -22,6 +23,7 @@ while [ $# -gt 0 ]; do
         --ini) INI="$2"; shift 2 ;;
         --user-exc) EXO0_ARGS+=(--user-exc); shift ;;
         --nand) NAND="$2"; shift 2 ;;
+        --sd) SD="$2"; shift 2 ;;
         --persist) SNAPSHOT=off; shift ;;
         --gdb) GDB=(-s -S); shift ;;
         --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log"); shift ;;
@@ -57,23 +59,35 @@ for f in "$ID"/aeskeyslot*.bin; do
 done
 
 EXTRA=()
+NBD_ARGS=(); [ "$SNAPSHOT" = off ] && NBD_ARGS=(--persist)
+# attach <emmc|sd> <sd index> <image|dir|none> <image> : snapshot=on keeps an image pristine (overlay in $TMPDIR);
+# dir serves the folder live: hvm_nbd composes the disk on the fly and exits when QEMU disconnects.
+attach() {
+    case "$3" in
+        image) [ -f "$4" ] || { echo "missing $4 (tools/mknand.py / tools/mksd.py --soc $SOC ... --image)" >&2; exit 1; }
+               EXTRA+=(-drive "if=sd,index=$2,format=raw,file=$4,snapshot=$SNAPSHOT") ;;
+        dir) local sock="$HVM/run/nbd-$1-$SOC.sock"
+             rm -f "$sock"
+             python3 "$ROOT/tools/hvm_nbd.py" serve --disk "$1" --soc "$SOC" --socket "$sock" "${NBD_ARGS[@]}" &
+             for _ in $(seq 1 240); do [ -S "$sock" ] && break; sleep 0.25; done
+             [ -S "$sock" ] || { echo "hvm_nbd ($1) did not start" >&2; exit 1; }
+             EXTRA+=(-drive "if=sd,index=$2,format=raw,file.driver=nbd,file.server.type=unix,file.server.path=$sock") ;;
+        none) ;;
+        *) echo "unknown $1 backend: $3" >&2; exit 2 ;;
+    esac
+}
 IMG="$HVM/nand/$SOC/emmc.img"
+SDIMG="$HVM/sd/$SOC/sd.img"
 [ -z "$NAND" ] && { [ -f "$IMG" ] && NAND=image || NAND=none; }
-case "$NAND" in
-    # SDMMC4 eMMC (tegrax1.c: sd index 3). snapshot=on keeps the image pristine; its overlay goes to $TMPDIR.
-    image) [ -f "$IMG" ] || { echo "missing $IMG (tools/mknand.py --soc $SOC --fw <FW> --image)" >&2; exit 1; }
-           EXTRA+=(-drive "if=sd,index=3,format=raw,file=$IMG,snapshot=$SNAPSHOT") ;;
-    # Live from the folder tree: hvm_nbd composes and encrypts the eMMC on the fly, exits when QEMU disconnects.
-    dir) SOCK="$HVM/run/nbd-$SOC.sock"
-         rm -f "$SOCK"
-         NBD_ARGS=(); [ "$SNAPSHOT" = off ] && NBD_ARGS=(--persist)
-         python3 "$ROOT/tools/hvm_nbd.py" serve --soc "$SOC" --socket "$SOCK" "${NBD_ARGS[@]}" &
-         for _ in $(seq 1 240); do [ -S "$SOCK" ] && break; sleep 0.25; done
-         [ -S "$SOCK" ] || { echo "hvm_nbd did not start" >&2; exit 1; }
-         EXTRA+=(-drive "if=sd,index=3,format=raw,file.driver=nbd,file.server.type=unix,file.server.path=$SOCK") ;;
-    none) ;;
-    *) echo "unknown nand backend: $NAND" >&2; exit 2 ;;
-esac
+if [ -z "$SD" ]; then                           # the card follows the eMMC backend once userland needs it
+    SD=none
+    case "$INI:$NAND" in
+        ams:image|stock:image) [ -f "$SDIMG" ] && SD=image ;;
+        ams:dir|stock:dir) [ -d "$HVM/sd/$SOC/dir" ] && SD=dir ;;
+    esac
+fi
+attach emmc 3 "$NAND" "$IMG"                    # SDMMC4 (tegrax1.c: sd index 3)
+attach sd 0 "$SD" "$SDIMG"                      # SDMMC1
 if [ "$SOC" = mariko ]; then
     # exosphere copies the Mariko fatal program from 0x80020000 into TZRAM (secmon_boot_setup.cpp LoadMarikoProgram).
     EXTRA+=(-device "loader,addr=0x80020000,force-raw=on,file=$AMS/exosphere/mariko_fatal/out/$OUT/mariko_fatal.bin")
