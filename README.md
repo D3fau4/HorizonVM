@@ -19,6 +19,8 @@ for soc in erista mariko; do         # per-profile VM identity in ~/.horizonvm (
     tools/mkfuses.py --soc $soc
     tools/hvm_keys.py --soc $soc --prod-keys /path/to/prod.keys --derive-bis
     tools/mknand.py --soc $soc --fw /path/to/firmware --image --verify   # eMMC: folder tree + encrypted image
+                                     # PRODINFO: tools/mkcal0.py (synthetic identity; optional factory calibration
+                                     # from ~/.horizonvm/ref/prodinfo-ref.bin; es key needs eticket_rsa_kek*_source)
     tools/mksd.py --soc $soc --dist third_party/Atmosphere/out/nintendo_nx_arm64_armv8a/release/atmosphere-*.zip \
         --image --verify                 # SD card (8 GiB, --size): atmosphere/ folder + FAT32 image
 done

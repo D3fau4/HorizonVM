@@ -14,6 +14,7 @@ import hvm_keys  # noqa: E402
 import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
 import hvm_nbd   # noqa: E402
+import mkcal0   # noqa: E402
 import mknand   # noqa: E402
 import mksd     # noqa: E402
 import mkexo0   # noqa: E402
@@ -661,6 +662,100 @@ class TestSd(unittest.TestCase):
         self.assertEqual(set(mknand.tree_files(self.tree)), set(want))
         self.assertFalse(os.path.exists(os.path.join(self.tree, 'atmosphere/package3')))
         disk.overlay.clear()
+
+
+class TestMkcal0(unittest.TestCase):
+    ECID = {'vendor': 1, 'fab': 2, 'lot0': 0x12345678, 'lot1': 3, 'wafer': 4, 'x': 5, 'y': 6, 'reserved': 0}
+    REF = os.path.join(hvm_nand.HVM, 'ref', 'prodinfo-ref.bin')
+
+    def fake_ref(self):
+        """A reference whose every block holds random data with a valid CRC."""
+        ref = bytearray(hashlib.sha512(b'ref').digest() * (hvm_nand.CAL0_SIZE // 64))
+        ref[:4] = b'CAL0'
+        for name, (off, size) in mkcal0.BLOCKS.items():
+            if name not in mkcal0.NO_CRC:
+                struct.pack_into('<H', ref, off + size - 2, hvm_nand.crc16(ref[off:off + size - 2]))
+        return bytes(ref)
+
+    def test_structure(self):
+        for soc in ('erista', 'mariko'):
+            for ref in (None, self.fake_ref()):
+                cal = mkcal0.build_cal0(soc, self.ECID, ref)
+                self.assertTrue(hvm_nand.check_cal0(cal))
+                self.assertEqual(mkcal0.check_blocks(cal), [])
+                for name in mkcal0.ABSENT | (mkcal0.OPTIONAL if ref is None else mkcal0.OPTIONAL - mkcal0.IMPORTED):
+                    self.assertFalse(mkcal0.crc_ok(cal, name), name)       # absent for HOS
+                serial = cal[0x250:0x250 + 14].decode()
+                self.assertEqual(serial[:4], mkcal0.PROFILES[soc]['serial_prefix'])
+                self.assertEqual(mkcal0.check_digit(serial[3:13]), serial[13])
+        self.assertEqual(mkcal0.check_digit('1007527345'), '2')             # switchbrew example
+
+    def test_only_whitelisted_reference_bytes_matter(self):
+        ref = bytearray(self.fake_ref())
+        imported = [mkcal0.BLOCKS[n] for n in mkcal0.IMPORTED]
+        other = bytearray(b ^ 0xFF for b in ref)
+        for off, size in imported:
+            other[off:off + size] = ref[off:off + size]
+        other[:4] = b'CAL0'
+        self.assertEqual(mkcal0.build_cal0('erista', self.ECID, bytes(ref)),
+                         mkcal0.build_cal0('erista', self.ECID, bytes(other)))
+
+    def test_device_id(self):
+        # CompressLotCode: base-36 digits of the 6-bit fields of lot0 (fuse_api.cpp)
+        clot0 = 0
+        for i in range(4, -1, -1):
+            clot0 = clot0 * 36 + ((self.ECID['lot0'] >> (i * 6)) & 0x3F)
+        self.assertEqual(mkcal0.device_id(self.ECID), 6 | 5 << 9 | 4 << 18 | (clot0 & ((1 << 26) - 1)) << 24 | 2 << 50)
+
+    @staticmethod
+    def ams_gmac(key, iv, aad):
+        """Port of libvapours crypto_gcm_mode_impl.arch.arm64.cpp (Reset with a 16-byte iv, UpdateAad, GetMac)."""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        enc = lambda b: Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(b)
+
+        def mult(x, y):                           # GaloisFieldMult on byte strings
+            xv, yv, out = int.from_bytes(x, 'big'), int.from_bytes(y, 'big'), 0
+            for _ in range(128):
+                if yv >> 127:
+                    out ^= xv
+                yv = (yv << 1) & ((1 << 128) - 1)
+                xv = (xv >> 1) ^ (0xE1 << 120 if xv & 1 else 0)
+            return out.to_bytes(16, 'big')
+
+        h = enc(bytes(16))
+
+        def ghash(data, msg_size, aad_size):
+            x = bytes(16)
+            for i in range(0, len(data), 16):
+                x = mult(bytes(a ^ b for a, b in zip(x, data[i:i + 16])), h)
+            last = (((msg_size | aad_size << 64) << 3) & ((1 << 128) - 1)).to_bytes(16, 'big')
+            return mult(bytes(a ^ b for a, b in zip(x, last)), h)
+
+        ek0 = ghash(iv, 16, 0)
+        return bytes(a ^ b for a, b in zip(ghash(aad, 0, len(aad)), enc(ek0)))
+
+    def test_device_unique_blob(self):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        key, iv = hashlib.sha256(b'k').digest()[:16], hashlib.sha256(b'iv').digest()[:16]
+        data = hashlib.sha512(b'd').digest() * 8 + bytes(16)                   # 0x210, like the RSA key
+        blob = mkcal0.encrypt_device_unique(key, iv, data, 0x6312345678ABCDEF)
+        self.assertEqual(len(blob), 0x240)                                     # ImportEsDeviceKey data size
+        enc, mac = blob[16:-16], blob[-16:]
+        plain = Cipher(algorithms.AES(key), modes.CTR(iv)).decryptor().update(enc)
+        self.assertEqual(self.ams_gmac(key, iv, plain), mac)                   # exosphere's GMAC check
+        self.assertEqual(plain[:len(data)], data)
+        self.assertEqual(struct.unpack('>Q', plain[-8:])[0] & ((1 << 56) - 1), 0x12345678ABCDEF)
+
+    @unittest.skipUnless(os.path.exists(os.path.join(hvm_nand.HVM, 'ref', 'prodinfo-ref.bin')), 'no reference PRODINFO')
+    def test_real_reference_identity_not_copied(self):
+        ref = read(self.REF)
+        cal = mkcal0.build_cal0('erista', self.ECID, ref)
+        for name in ('SerialNumber', 'WlanMacAddress', 'BdAddress', 'BatteryLot', 'RandomNumber',
+                     'EccB233DeviceCertificate', 'Rsa2048ETicketCertificate', 'GameCardCertificate',
+                     'AmiiboEcdsaCertificate', 'AmiiboEcqvBlsRootCertificate'):
+            off, size = mkcal0.BLOCKS[name]
+            if any(ref[off:off + size - 2]):
+                self.assertNotEqual(cal[off:off + size - 2], ref[off:off + size - 2], name)
 
 
 def tipc(cmd, name=b'', pid=False):

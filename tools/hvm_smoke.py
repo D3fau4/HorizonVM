@@ -24,8 +24,8 @@ READY = {'ams': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot2'),
 EXTRA_ALLOWED = {'ams': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2),
                  'stock': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2)}
 # Known frontier: sysmodules that crash on the synthetic console (program ids).
-EXPECTED_CRASHES = {'ams': {'010000000000002b'},                          # erpt
-                    'stock': {'010000000000002b', '0100000000000034'}}    # erpt, fatal
+EXPECTED_CRASHES = {'ams': set(),
+                    'stock': {'010000000000000b'}}    # bluetooth
 LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
 IDLE_SAMPLES = 5
 # Cores that must reach WFI. With boot2's sysmodules up, core 3 (their only core) stays busy: nvservices polls
@@ -137,8 +137,13 @@ def writeback_checks(soc, ini, nand, persist):
         return []
     saves = os.path.join(HVM, 'nand', soc, 'dir', 'SYSTEM', 'save')
     names = set(os.listdir(saves)) if os.path.isdir(saves) else set()
+    backups = os.path.join(HVM, 'sd', soc, 'dir', 'atmosphere', 'automatic_backups')
+    with open(os.path.join(HVM, 'nand', soc, 'dir', 'PRODINFO.bin'), 'rb') as f:
+        serial = f.read(0x250 + 14)[0x250:].decode('ascii', 'replace')
     return [('write-back: FS-created saves in the folder (SYSTEM/save/8000000000000000, 8000000000000120)',
-             {'8000000000000000', '8000000000000120'} <= names)]
+             {'8000000000000000', '8000000000000120'} <= names),
+            ('write-back: ams_mitm backs the CAL0 up as <serial>_PRODINFO.bin (valid for a secure backup)',
+             os.path.isdir(backups) and serial + '_PRODINFO.bin' in os.listdir(backups))]
 
 
 def user_smc_calls(trace):
@@ -187,7 +192,7 @@ def ams_checks(trace, log):
          not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups']) and 'pcie' in registered_by(trace, 'pcie')),
         ('ams_mitm mounts the SD: pm launches Atmosphère boot2 from stratosphere.romfs, and it launches memlet',
          {'boot2', 'memlet'} <= names),
-        ('crashes: only the known frontier (erpt)', set(trace['crashes']) <= EXPECTED_CRASHES['ams']),
+        ('no sysmodule crashed', not trace['crashes']),
     ]
 
 
@@ -218,7 +223,7 @@ def stock_checks(trace, log, ncm_db):
         ('pcv initializes (no fatal:u); boot2 goes past omm: am nvservices vi ns hid audio',
          not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups'])
          and {'am', 'nvservices', 'vi', 'ns', 'hid', 'audio'} <= names),
-        ('crashes: only the known frontier (erpt, fatal)', set(trace['crashes']) <= EXPECTED_CRASHES['stock']),
+        ('crashes: only the known frontier (bluetooth)', set(trace['crashes']) <= EXPECTED_CRASHES['stock']),
     ] if ncm_db else [
         ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
          any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND

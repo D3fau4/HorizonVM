@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 import hvm_nand as nand
+import mkcal0
 
 TREE_DIRS = ['PRODINFOF', 'SAFE', 'SYSTEM/Contents/registered', 'SYSTEM/Contents/placehld', 'SYSTEM/save',
              'SYSTEM/saveMeta', 'USER/Contents/registered', 'USER/Contents/placehld', 'USER/save',
@@ -19,7 +20,15 @@ TREE_DIRS = ['PRODINFOF', 'SAFE', 'SYSTEM/Contents/registered', 'SYSTEM/Contents
 MTOOLS_ENV = dict(os.environ, MTOOLS_SKIP_CHECK='1', MTOOLS_NO_VFAT='0')
 
 
-def populate_tree(tree, fw):
+def write_cal0(tree, soc, kind, prod_keys=None):
+    cal0 = nand.build_blank_cal0() if kind == 'blank' else \
+        mkcal0.build_cal0(soc, mkcal0.load_ecid(soc), mkcal0.load_ref(mkcal0.REF_DEFAULT),
+                          mkcal0.load_eticket(soc, prod_keys))
+    with open(os.path.join(tree, 'PRODINFO.bin'), 'wb') as f:
+        f.write(cal0)
+
+
+def populate_tree(tree, fw, soc, prod_keys=None):
     """SYSTEM holds every NCA of the dump, flat as ncm's BuiltInSystem storage expects (registered/<id>.nca)."""
     ncas = sorted(glob.glob(os.path.join(fw, 'sysupdate-*', '*.nca')))
     if not ncas:
@@ -30,10 +39,8 @@ def populate_tree(tree, fw):
     for src in ncas:
         name = os.path.basename(src)
         shutil.copyfile(src, os.path.join(reg, name[:32] + '.nca'))    # <id>.cnmt.nca -> <id>.nca
-    cal0 = os.path.join(tree, 'PRODINFO.bin')
-    if not os.path.exists(cal0):
-        with open(cal0, 'wb') as f:
-            f.write(nand.build_blank_cal0())
+    if not os.path.exists(os.path.join(tree, 'PRODINFO.bin')):
+        write_cal0(tree, soc, 'generated', prod_keys)
     return len(ncas)
 
 
@@ -268,6 +275,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--soc', required=True, choices=['erista', 'mariko'])
     ap.add_argument('--fw', help='firmware dump (sysupdate-*/ NCAs) to populate the folder tree')
+    ap.add_argument('--cal0', choices=['generated', 'blank'],
+                    help='(re)write PRODINFO.bin: mkcal0 (default for a new tree) or the blank CAL0 of ams_mitm')
+    ap.add_argument('--prod-keys', help='for the generated CAL0 eTicket key (default: <fw>/prod.keys)')
     ap.add_argument('--image', action='store_true', help='build emmc.img from the folder tree')
     ap.add_argument('--verify', action='store_true', help='check emmc.img against the folder tree')
     ap.add_argument('--tree', help='folder tree (default ~/.horizonvm/nand/<soc>/dir)')
@@ -278,8 +288,12 @@ def main():
     paths = nand.soc_paths(args.soc)
     tree = args.tree or paths['dir']
     img = args.output or paths['image']
+    prod_keys = args.prod_keys or (os.path.join(args.fw, 'prod.keys') if args.fw else None)
     if args.fw:
-        print('%s: %d NCAs' % (tree, populate_tree(tree, args.fw)))
+        print('%s: %d NCAs' % (tree, populate_tree(tree, args.fw, args.soc, prod_keys)))
+    if args.cal0:
+        write_cal0(tree, args.soc, args.cal0, prod_keys)
+        print('%s: %s CAL0' % (os.path.join(tree, 'PRODINFO.bin'), args.cal0))
     if args.image:
         build_image(args.soc, tree, img)
         print('%s: ok' % img)
