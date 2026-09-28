@@ -17,11 +17,51 @@ def align_up(v, a):
     return (v + a - 1) // a * a
 
 
+# kern_k_capabilities.hpp CapabilityType: the type is the number of trailing one bits.
+CAP_TYPES = {(1 << n) - 1 for n in (3, 4, 6, 7, 10, 11, 13, 14, 15, 16)} | {0xFFFFFFFF}
+CAP_CORE_PRIORITY = (1 << 3) - 1
+
+
+def kip_size(k):
+    """KInitialProcessReader: 0x100-byte header followed by the rx/ro/rw segments (compressed sizes)."""
+    return 0x100 + sum(struct.unpack_from('<I', k, off)[0] for off in (0x28, 0x38, 0x48))
+
+
+def check_kip(k):
+    """Reject what Mesosphere would panic on when creating an initial process (kern_k_capabilities.cpp)."""
+    if len(k) < 0x100 or k[:4] != b'KIP1':
+        raise ValueError('not a KIP1 image')
+    name = k[4:0x10].rstrip(b'\0').decode(errors='replace')
+    if kip_size(k) != len(k):
+        raise ValueError('%s: size 0x%x does not match its header (0x%x)' % (name, len(k), kip_size(k)))
+    for cap in struct.unpack_from('<32I', k, 0x80):
+        ctype = ((~cap & (cap + 1)) - 1) & 0xFFFFFFFF
+        if ctype == 0:
+            raise ValueError('%s: invalid capability 0x%08x (unused slots must be 0xFFFFFFFF)' % (name, cap))
+        if ctype == CAP_CORE_PRIORITY:
+            raise ValueError('%s: initial processes cannot have a CorePriority capability' % name)
+        if ctype not in CAP_TYPES:
+            raise ValueError('%s: unknown capability 0x%08x' % (name, cap))
+
+
+def split_ini1(ini):
+    magic, size, count, _ = struct.unpack_from('<4sIII', ini, 0)
+    if magic != b'INI1' or size > len(ini):
+        raise ValueError('not an INI1 image')
+    kips, off = [], 0x10
+    for _ in range(count):
+        n = kip_size(ini[off:off + 0x100])
+        kips.append(ini[off:off + n])
+        off += n
+    if off != size:
+        raise ValueError('INI1 size mismatch (0x%x != 0x%x)' % (off, size))
+    return kips
+
+
 def build_ini1(kips):
     seen = set()
     for k in kips:
-        if k[:4] != b'KIP1':
-            raise ValueError('not a KIP1 image')
+        check_kip(k)
         pid = struct.unpack_from('<Q', k, 0x10)[0]
         if pid in seen:
             raise ValueError('duplicate program_id %016x' % pid)
@@ -91,6 +131,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('mesosphere')
     ap.add_argument('-o', '--output', required=True)
+    ap.add_argument('--ini1', help='take the KIPs of an existing INI1 (placed before --kip ones)')
     ap.add_argument('--kip', action='append', default=[], help='KIP to embed in the INI1 (repeatable)')
     args = ap.parse_args()
 
@@ -98,7 +139,8 @@ def main():
         with open(path, 'rb') as f:
             return f.read()
 
-    kips = [read(k) for k in args.kip]
+    kips = split_ini1(read(args.ini1)) if args.ini1 else []
+    kips += [read(k) for k in args.kip]
     pkg2 = build_package2(read(args.mesosphere), kips)
     if not verify_package2(pkg2):
         sys.exit('internal error: package2 fails exosphere validation')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless boot smoke test: exosphere -> Mesosphere reaches Initialized with all cores idle."""
+"""Headless boot smoke test: exosphere -> Mesosphere (-> INI1 processes) reaches its expected state per SoC x INI1 profile."""
 import argparse
 import os
 import re
@@ -15,6 +15,16 @@ HVM = os.environ.get('HORIZONVM_HOME', os.path.expanduser('~/.horizonvm'))
 KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/nintendo_nx_arm64_armv8a/debug/kernel.elf')
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
+PROFILES = ('empty', 'core', 'ams', 'stock')
+SETTLE = {'empty': 5, 'core': 8, 'ams': 15, 'stock': 10}     # seconds after the kernel layout / READY
+# Line that marks a profile's userland milestone, in the trace (smc lines are flushed as they happen) or on the
+# UART: boot's SetConfig(ExosphereApiVersion) through spl (ams), Nintendo's boot exiting after NotifyBootFinished.
+READY = {'ams': ('trace', r'smc_ret cpu=3 el=1 pc=0x[0-9a-f]+ imm=0 id=0xc3000401 x0=0x0 x1=0xfde8'),
+         'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot')}
+EXTRA_ALLOWED = {'stock': hvm_log.ALLOWED_BOOT_HW}
+LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
+IDLE_SAMPLES = 5
+SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 
@@ -57,7 +67,7 @@ def monitor(sock_path, commands):
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
 
-def smoke(soc, timeout):
+def smoke(soc, ini, nand, timeout, persist=False):
     os.makedirs(os.path.join(HVM, 'run'), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(HVM, 'logs'), mode=0o700, exist_ok=True)
     sock = os.path.join(HVM, 'run', 'mon-%s.sock' % soc)
@@ -67,53 +77,181 @@ def smoke(soc, timeout):
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--trace', '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + (['--persist'] if persist else []) + ['--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
         m = wait_for(uart, r'KernelRegion[^\n]*\n\s+Code\s+(0x[0-9a-f]+)', proc, timeout)
         base = int(m.group(1), 16) if m else None
-        time.sleep(5)   # let init finish and the cores go idle
-        mon = ''
+        if base is not None and ini in READY:
+            where, pattern = READY[ini]
+            wait_for(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc) if where == 'trace' else uart, pattern, proc, timeout)
+        time.sleep(SETTLE[ini])   # let init finish and the cores go idle
+        mon, samples = '', []
         if base is not None and proc.poll() is None:
-            cmds = ['x /1bx 0x%x' % (base + s_state_off)] + sum([['cpu %d' % c, 'info registers'] for c in range(4)], [])
-            mon = monitor(sock, cmds)
+            mon = monitor(sock, ['x /1bx 0x%x' % (base + s_state_off)])
+            for _ in range(IDLE_SAMPLES):   # periodic pollers may be awake at any single instant
+                regs = monitor(sock, sum([['cpu %d' % c, 'info registers'] for c in range(4)], []))
+                samples.append([int(p, 16) - base for p in re.findall(r'PC=([0-9a-f]+)', regs)])
+                time.sleep(0.3)
     finally:
         proc.terminate()
         proc.wait()
+    lock = os.path.join(HVM, 'nand', soc, 'overlay', 'lock')
+    end = time.time() + 120
+    while nand == 'dir' and persist and os.path.exists(lock) and time.time() < end:
+        time.sleep(0.5)                                 # hvm_nbd writes back once QEMU has disconnected
 
     with open(uart, 'rb') as f:
         log = f.read().decode('latin-1')
     state = re.search(r'^[0-9a-f]+: (0x[0-9a-f]+)', mon, re.M)
-    pcs = [int(p, 16) - base for p in re.findall(r'PC=([0-9a-f]+)', mon)] if base else []
+    idle_cores = {c for pcs in samples if len(pcs) == 4 for c, p in enumerate(pcs) if idle[0] <= p <= idle[1]}
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
-                            os.path.join(HVM, 'logs', 'qemu-%s.log' % soc))
+                            os.path.join(HVM, 'logs', 'qemu-%s.log' % soc),
+                            os.path.join(HVM, 'logs', 'uart-%s.log' % soc),
+                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})))
     for v in trace['violations']:
-        print('%-7s trace: %s' % (soc, v))
+        print('%-7s %-5s %-5s trace: %s' % (soc, ini, nand or '', v))
     return [
         ('exosphere OHAYO (single boot)', log.count('OHAYO') == 1),
         ('exosphere KeyGen 15', '[secmon] KeyGen: 15' in log),
         ('kernel banner', 'Horizon Kernel (Mesosphere)' in log),
         ('no kernel panic', 'Kernel Panic' not in log),
         ('Kernel::s_state == Initialized', bool(state) and int(state.group(1), 16) == KERNEL_STATE_INITIALIZED),
-        ('4 cores idle in WFI', len(pcs) == 4 and all(idle[0] <= p <= idle[1] for p in pcs)),
-        ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][0xC4000003] == 3),
-        ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted', not trace['violations']),
+        ('4 cores idle in WFI', idle_cores == {0, 1, 2, 3}),
+        ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
+        ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
+    ] + profile_checks(soc, ini, trace, log) + writeback_checks(soc, ini, nand, persist)
+
+
+def writeback_checks(soc, ini, nand, persist):
+    if nand != 'dir' or not persist or ini != 'ams':
+        return []
+    saves = os.path.join(HVM, 'nand', soc, 'dir', 'SYSTEM', 'save')
+    names = set(os.listdir(saves)) if os.path.isdir(saves) else set()
+    return [('write-back: FS-created saves in the folder (SYSTEM/save/8000000000000000, 8000000000000120)',
+             {'8000000000000000', '8000000000000120'} <= names)]
+
+
+def user_smc_calls(trace):
+    """Pair user SMCs with their returns (exosphere runs them with interrupts masked, one at a time per core)."""
+    calls, last = [], {}
+    for kind, cpu, sid, regs in trace['user_smc']:
+        if kind == 'smc':
+            last[cpu] = (sid, regs)
+        elif cpu in last:
+            sid0, args = last.pop(cpu)
+            calls.append((sid0, args, regs))
+    return calls
+
+
+def registered_by(trace, name):
+    pids = pids_named(trace, name)
+    return {n for p, n in trace['registered'] if p in pids}
+
+
+def ams_checks(trace, log):
+    names = set(trace['procs'].values())
+    set_version = [(a, r) for sid, a, r in user_smc_calls(trace) if sid == 0xC3000401 and a.get(1) == '0xfde8']
+    boot = pids_named(trace, 'boot')
+    boot_ports = [n for p, what, n in trace['ports'] if p in boot and what == 'ConnectToNamedPort']
+    return [
+        ('7 INI1 processes started', names == {'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl', 'FS'}),
+        ('FS drives the eMMC (SDMMC4 MMIO)', 'sdmmc' in trace['mmio']),
+        ('FS registers fsp-srv fsp-pr fsp-ldr', {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
+        ('spl registers its services', SPL_SERVICES <= registered_by(trace, 'spl')),
+        ('ncm mounted SYSTEM and its content meta DB: registers ncm lr', {'ncm', 'lr'} <= registered_by(trace, 'NCM')),
+        ('boot sets the real HOS version: SetConfig(65000, 22.5.0) -> 0 on core 3',
+         [(a.get(3), r.get(0)) for a, r in set_version] == [('0x16050000', '0x0')]),
+        ('loader registers ldr:pm ldr:shel ldr:dmnt', {'ldr:pm', 'ldr:shel', 'ldr:dmnt'} <= registered_by(trace, 'Loader')),
+        ('pm registers pm:shell pm:dmnt pm:bm pm:info',
+         {'pm:shell', 'pm:dmnt', 'pm:bm', 'pm:info'} <= registered_by(trace, 'ProcessMana')),
+        ('frontier: boot waits for bpc:ams (ams_mitm is F3)', boot_ports.count('bpc:ams') >= 2),
+        ('no process exited', 'KProcess::Exit()' not in log and 'KProcess::Terminate()' not in log),
     ]
+
+
+BOOT2_MODULES = {'boot2.ProdB', 'psc', 'settings', 'usb', 'pcie', 'Bus', 'pcv'}   # KProcess names (12 chars)
+
+
+def stock_checks(trace, log, ncm_db):
+    """Nintendo's own 22.5.0 INI1 on exosphere + Mesosphere + the synthetic NAND."""
+    names = set(trace['procs'].values())
+    boot = pids_named(trace, 'boot')
+    pm = pids_named(trace, 'ProcessMana')
+    return [
+        ('the 7 official INI1 processes started', {'FS', 'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl'} <= names),
+        ('FS drives the eMMC and registers fsp-srv fsp-pr fsp-ldr',
+         'sdmmc' in trace['mmio'] and {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
+        ('spl, ncm, loader and pm register their services',
+         SPL_SERVICES <= registered_by(trace, 'spl') and {'ncm', 'lr'} <= registered_by(trace, 'NCM')
+         and {'ldr:pm', 'ldr:shel', 'ldr:dmnt'} <= registered_by(trace, 'Loader')
+         and {'pm:shell', 'pm:dmnt', 'pm:bm', 'pm:info'} <= registered_by(trace, 'ProcessMana')),
+        ('boot initializes I2C/GPIO/PWM/display, notifies pm:shell and exits',
+         {'i2c', 'gpio', 'pwm', 'host1x_modules'} <= set(trace['mmio'])
+         and any(p in boot and n == 'pm:shell' for p, n in trace['lookups'])
+         and re.search(r'KProcess::Exit\(\) pid=\d+ name=boot', log) is not None),
+    ] + ([
+        ('with the ncm DB on the NAND, pm launches boot2 and it starts psc settings usb pcie Bus pcv',
+         BOOT2_MODULES <= names),
+    ] if ncm_db else [
+        ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
+         any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND
+             for p, svc, cmd, rc in trace['ipc_failures'])),
+    ])
+
+
+def pids_named(trace, name):
+    return {p for p, n in trace['procs'].items() if n == name}
+
+
+def ncm_db_in_tree(soc):
+    """BuiltInSystem content meta DB save, as persisted by a --persist run (images are built from the same tree)."""
+    return os.path.exists(os.path.join(HVM, 'nand', soc, 'dir', 'SYSTEM', 'save', '8000000000000120'))
+
+
+def profile_checks(soc, ini, trace, log):
+    if ini == 'empty':
+        return []
+    if ini == 'ams':
+        return ams_checks(trace, log)
+    if ini == 'stock':
+        return stock_checks(trace, log, ncm_db_in_tree(soc))
+    calls = user_smc_calls(trace)
+    get_config = {(a.get(1), r.get(0)) for sid, a, r in calls if sid == 0xC3000002}
+    sm, spl = pids_named(trace, 'sm'), pids_named(trace, 'spl')
+    checks = [
+        ('sm and spl started', bool(sm) and bool(spl)),
+        ('sm serves the "sm:" named port', any(p in sm and what == 'ManageNamedPort' and n == 'sm:'
+                                               for p, what, n in trace['ports'])),
+        ('spl registers %s' % ' '.join(sorted(SPL_SERVICES)),
+         SPL_SERVICES <= {n for p, n in trace['registered'] if p in spl}),
+        ('user GetConfig(65000) -> NotInitialized, GetConfig(65012) ok',
+         ('0xfde8', '0x7') in get_config and ('0xfdf4', '0x0') in get_config),
+        ('spl RNG through user GenerateRandomBytes (redacted)', any(sid == 0xC3000006 for sid, _, _ in calls)),
+    ]
+    return checks
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--soc', action='append', choices=['erista', 'mariko'])
-    ap.add_argument('--timeout', type=int, default=60)
+    ap.add_argument('--ini', help='comma-separated INI1 profiles (default: every built build/package2-<ini>.bin)')
+    ap.add_argument('--nand', help='comma-separated eMMC backends for run.sh --nand (default: run.sh default)')
+    ap.add_argument('--persist', action='store_true', help='keep eMMC writes (run.sh --persist)')
+    ap.add_argument('--timeout', type=int, default=180)
     args = ap.parse_args()
     os.umask(0o077)
 
+    inis = args.ini.split(',') if args.ini else [
+        i for i in PROFILES if os.path.exists(os.path.join(ROOT, 'build', 'package2-%s.bin' % i))]
     failed = False
-    for soc in args.soc or ['erista', 'mariko']:
-        for name, ok in smoke(soc, args.timeout):
-            print('%-7s %-6s %s' % (soc, 'PASS' if ok else 'FAIL', name))
-            failed |= not ok
+    for nand in args.nand.split(',') if args.nand else [None]:
+        for ini in inis:
+            for soc in args.soc or ['erista', 'mariko']:
+                for name, ok in smoke(soc, ini, nand, args.timeout, args.persist):
+                    print('%-7s %-5s %-5s %-6s %s' % (soc, ini, nand or '', 'PASS' if ok else 'FAIL', name))
+                    failed |= not ok
     sys.exit(1 if failed else 0)
 
 
