@@ -748,6 +748,11 @@ class TestHvmLog(unittest.TestCase):
             'smc_ret cpu=0 el=1 pc=0x0 imm=1 id=0xc3000005 x0=0x0 x1=0x5\n': 'not redacted',
             'smc cpu=3 el=1 pc=0x0 imm=0 id=0xc3000007 x1=0x1234 x2=<redacted>\n': 'GenerateAesKek not redacted',
             'smc_ret cpu=3 el=1 pc=0x0 imm=0 id=0xc3000006 x0=0x0 x1=0xabcd\n': 'GenerateRandomBytes not redacted',
+            'svc cpu=3 pid=6 tls=0x1 pc=0x0 id=0x7f x0=0xc300100d x1=0x1234 x2=<redacted> x3=<redacted>\n':
+                'CallSecureMonitor(DecryptDeviceUniqueData) not redacted',
+            'svc cpu=3 pid=6 tls=0x1 pc=0x0 id=0x7f x0=0xc3000006 x1=<redacted> x2=<redacted> x3=<redacted>\n'
+            'svc_ret cpu=3 pid=6 tls=0x1 pc=0x4 id=0x7f x0=0x0 x1=0xabcd x2=<redacted> x3=<redacted>\n':
+                'svc_ret CallSecureMonitor(GenerateRandomBytes) not redacted',
             'smc cpu=1 el=1 pc=0x0 imm=0 id=0xc3000002 x1=0x3\n': 'core 1',
         }
         for line, expect in cases.items():

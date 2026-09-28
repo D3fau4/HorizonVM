@@ -172,12 +172,22 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, exp
     handles = {}          # (pid, handle) -> service name, from sm replies
     ipc_calls = {}        # (pid, tls) -> (service, command) of an outstanding SendSyncRequest
     ipc_failures = collections.Counter()   # (pid, service, command, result) -> count
+    secmon_calls = {}     # (pid, tls) -> user SMC forwarded by an outstanding CallSecureMonitor
     with open(trace_path, errors='replace') as f:
         for line in f:
             m = SVC_RE.match(line)
             if m:
                 kind, _, pid, tls, sid, rest = m.groups()
                 pid, sid, key = int(pid), int(sid, 16), (int(pid), tls)
+                if sid == 0x7F:   # CallSecureMonitor carries a user SMC: same redaction policy as the smc lines
+                    regs = regs_of(rest)
+                    if kind == 'svc':
+                        secmon_calls[key] = (0, int(regs.get(0, '0x0'), 16))
+                    k = secmon_calls.get(key, (0, None)) if kind == 'svc' else secmon_calls.pop(key, (0, None))
+                    public = SMC_ARGS_PUBLIC if kind == 'svc' else SMC_RESULTS_PUBLIC
+                    open_regs = SMC_ARG_REGS_PUBLIC.get(k, set()) if kind == 'svc' else set()
+                    if k not in public and any(v != '<redacted>' for r, v in regs.items() if r and r not in open_regs):
+                        leaks.append('%s CallSecureMonitor(%s) not redacted' % (kind, SMC_NAMES.get(k, k[1])))
                 if kind == 'svc':
                     svc[(pid, sid)] += 1
                     desc = SVC_NAMES.get(sid, 'svc%#x' % sid)

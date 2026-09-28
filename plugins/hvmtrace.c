@@ -23,6 +23,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define SVC_SEND_SYNC_REQUEST               0x21
 #define SVC_SEND_SYNC_REQUEST_WITH_USER_BUF 0x22
 #define SVC_MANAGE_NAMED_PORT               0x71
+#define SVC_CALL_SECURE_MONITOR             0x7F
 #define SM_MSG_LOG_SIZE                     0x40
 #define BACKTRACE_DEPTH                     12
 #define IPC_HEADER_READ                     0x80
@@ -52,6 +53,7 @@ typedef struct {
     bool sm_session;   /* request to sm: dump its reply too (moved service handle) */
     int ipc_kind;      /* protocol of a SendSyncRequest, to find the result code in the reply */
     uint64_t msg_va;   /* TLS or user buffer holding the message */
+    uint64_t smc_id;   /* CallSecureMonitor: the user SMC it forwards (x0) */
 } SvcCall;
 
 static const struct { uint64_t start, end; } redacted_mmio[] = {
@@ -309,11 +311,19 @@ static void on_svc(unsigned int cpu, void *udata)
     GString *line = g_string_new(NULL);
     g_string_append_printf(line, "svc cpu=%u pid=%" PRIu64 " tls=0x%" PRIx64 " pc=0x%" PRIx64 " id=0x%" PRIx64,
                            cpu, pid, tls, pc, id);
-    append_regs(line, s, 0, 3, true);
-
     SvcCall *call = g_new0(SvcCall, 1);
     call->ret_pc = pc + 4;
     call->id = id;
+    if (id == SVC_CALL_SECURE_MONITOR) {
+        /* The same registers reach exosphere as a user SMC: apply the SMC redaction policy to them. */
+        call->smc_id = x0;
+        append_regs(line, s, 0, 0, true);
+        for (int i = 1; i <= 3; i++) {
+            append_regs(line, s, i, i, smc_arg_public(0, x0, i));
+        }
+    } else {
+        append_regs(line, s, 0, 3, true);
+    }
     g_mutex_lock(&lock);
     bool sm_session = false;
     if (id == SVC_SEND_SYNC_REQUEST) {
@@ -366,7 +376,7 @@ static void on_svc_return(unsigned int cpu, void *udata)
         g_mutex_unlock(&lock);
         return;
     }
-    uint64_t id = call->id, msg_va = call->msg_va;
+    uint64_t id = call->id, msg_va = call->msg_va, smc_id = call->smc_id;
     bool connect_sm = call->connect_sm, sm_session = call->sm_session;
     int ipc_kind = call->ipc_kind;
     g_hash_table_remove(svc_pending, key);
@@ -379,7 +389,12 @@ static void on_svc_return(unsigned int cpu, void *udata)
     GString *line = g_string_new(NULL);
     g_string_append_printf(line, "svc_ret cpu=%u pid=%" PRIu64 " tls=0x%" PRIx64 " pc=0x%" PRIx64 " id=0x%" PRIx64,
                            cpu, pid, tls, pc, id);
-    append_regs(line, s, 0, 3, true);
+    if (id == SVC_CALL_SECURE_MONITOR) {
+        append_regs(line, s, 0, 0, true);
+        append_regs(line, s, 1, 3, smc_results_public(0, smc_id));
+    } else {
+        append_regs(line, s, 0, 3, true);
+    }
     uint32_t result;
     if (ipc_kind != IPC_NONE && x0 == 0 && ipc_decode(msg_va, true, &ipc_kind, &result)) {
         g_string_append_printf(line, " ipc_result=0x%x", result);
