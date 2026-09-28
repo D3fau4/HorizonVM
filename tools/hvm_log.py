@@ -40,7 +40,7 @@ ALLOWED = {
     'sdmmc': 'FS eMMC driver (SDMMC4)',
 }
 # Hardware Nintendo's boot sysmodule initializes (PMIC/charger/fuel gauge over I2C, GPIO, backlight PWM,
-# display/DSI); allowed only for INI1 profiles that run it (Atmosphère's boot stops at bpc:ams before this).
+# display/DSI); allowed only for INI1 profiles that run it (stock, and ams once ams_mitm serves bpc:ams).
 ALLOWED_BOOT_HW = {'i2c': 'boot: PMIC/charger/fuel gauge', 'gpio': 'boot: GPIO config', 'pwm': 'boot: backlight',
                    'host1x_modules': 'boot: display (DC/DSI)', 'mipi_cal': 'boot: DSI pad calibration'}
 
@@ -56,6 +56,9 @@ SMC_NAMES = {
     (0, 0xC300D60C): 'ReencryptDeviceUniqueData', (0, 0xC300100D): 'DecryptDeviceUniqueData',
     (0, 0xC300060F): 'ModularExponentiateByStorageKey', (0, 0xC3000610): 'PrepareEsDeviceUniqueKey',
     (0, 0xC3000011): 'LoadPreparedAesKey', (0, 0xC3000012): 'PrepareEsCommonTitleKey',
+    # Atmosphère extensions (secmon_smc_handler.cpp): boot's PMC access, ams_mitm's emummc query.
+    (0, 0xF0000201): 'IramCopy', (0, 0xF0000002): 'ReadWriteRegister', (0, 0xF0000003): 'WriteAddress',
+    (0, 0xF0000404): 'GetEmummcConfig',
 }
 SMC_ARGS_PUBLIC = {k for k in SMC_NAMES if k[0] == 1} | {(0, 0xC3000002), (0, 0xC3000401)}   # = hvmtrace.c
 SMC_RESULTS_PUBLIC = SMC_ARGS_PUBLIC - {(1, 0xC3000005)}

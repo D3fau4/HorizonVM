@@ -35,6 +35,7 @@ pkg2 core "$(kip sm)" "$(kip spl)"
 if [ -n "${HVM_FW:-}" ]; then
     FWK="$HVM_FW/Processed/BootImagePackage/romfs/nx/package2.storage"
     # fusee's order (build_package3.py) with Nintendo's FS appended (fusee_stratosphere.cpp).
-    pkg2 ams "$(kip loader)" "$(kip ncm)" "$(kip pm)" "$(kip sm)" "$(kip boot)" "$(kip spl)" --kip="$FWK/kips/FS.kip1"
+    pkg2 ams "$(kip loader)" "$(kip ncm)" "$(kip pm)" "$(kip sm)" "$(kip boot)" "$(kip spl)" "$(kip ams_mitm)" \
+        --kip="$FWK/kips/FS.kip1"
     pkg2 stock --ini1="$FWK/INI1.bin"
 fi

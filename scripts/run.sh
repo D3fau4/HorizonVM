@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
 # usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--sd image|dir|none]
-#               [--persist] [--user-exc] [--gdb] [--trace] [-- extra qemu args]
+#               [--persist] [--maintenance] [--display] [--user-exc] [--gdb] [--trace] [-- extra qemu args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,6 +13,8 @@ INI=
 NAND=
 SD=
 SNAPSHOT=on
+BUTTONS=0xC0
+DISPLAY_ARGS=(-display none)
 EXO0_ARGS=()
 GDB=()
 TRACE=()
@@ -25,6 +27,9 @@ while [ $# -gt 0 ]; do
         --nand) NAND="$2"; shift 2 ;;
         --sd) SD="$2"; shift 2 ;;
         --persist) SNAPSHOT=off; shift ;;
+        --maintenance) BUTTONS=0; shift ;;
+        --display) DISPLAY_ARGS=(-display none -vnc "127.0.0.1:$((${HVM_VNC:-5900} - 5900))")
+                   echo "display: VNC on 127.0.0.1:${HVM_VNC:-5900}" >&2; shift ;;
         --gdb) GDB=(-s -S); shift ;;
         --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log"); shift ;;
         --) shift; break ;;
@@ -103,10 +108,11 @@ python3 "$ROOT/tools/mkexo0.py" -o "$HVM/run/exo0-$SOC.bin" "${EXO0_ARGS[@]}"
 # 0xA9800000 is where exosphere expects the plaintext package2 (secmon_memory_layout.hpp),
 # 0x8000F000 is the EXO0 storage configuration (secmon_monitor_context.hpp).
 exec "$ROOT/build/qemu/qemu-system-aarch64" \
-    -machine "$MACHINE" -m 8G -display none \
+    -machine "$MACHINE" -m 8G "${DISPLAY_ARGS[@]}" \
     -chardev "stdio,id=uart,mux=on,logfile=$HVM/logs/uart-$SOC.log" -serial chardev:uart -mon chardev=uart \
     -global driver=tegra.evp,property=cpu-reset-vector,value=0x40030000 \
     -global driver=tegra.flow,property=cop-halted,value=on \
+    -global "driver=tegra.gpio,property=reset-value-bank5-port3,value=$BUTTONS" \
     -device "loader,addr=0x40030000,force-raw=on,file=$AMS/exosphere/out/$OUT/exosphere.bin" \
     -device "loader,addr=0xA9800000,force-raw=on,file=$PKG2" \
     -device "loader,addr=0x8000F000,force-raw=on,file=$HVM/run/exo0-$SOC.bin" \

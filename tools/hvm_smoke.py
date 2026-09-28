@@ -16,12 +16,12 @@ KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/ni
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
 PROFILES = ('empty', 'core', 'ams', 'stock')
-SETTLE = {'empty': 5, 'core': 8, 'ams': 15, 'stock': 10}     # seconds after the kernel layout / READY
+SETTLE = {'empty': 5, 'core': 8, 'ams': 20, 'stock': 10}     # seconds after the kernel layout / READY
 # Line that marks a profile's userland milestone, in the trace (smc lines are flushed as they happen) or on the
-# UART: boot's SetConfig(ExosphereApiVersion) through spl (ams), Nintendo's boot exiting after NotifyBootFinished.
-READY = {'ams': ('trace', r'smc_ret cpu=3 el=1 pc=0x[0-9a-f]+ imm=0 id=0xc3000401 x0=0x0 x1=0xfde8'),
+# UART: pm starting usb, the last pre-SD boot2 program (ams); Nintendo's boot exiting after NotifyBootFinished.
+READY = {'ams': ('uart', r'KProcess::Run\(\) pid=\d+ name=usb'),
          'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot')}
-EXTRA_ALLOWED = {'stock': hvm_log.ALLOWED_BOOT_HW}
+EXTRA_ALLOWED = {'ams': hvm_log.ALLOWED_BOOT_HW, 'stock': hvm_log.ALLOWED_BOOT_HW}
 LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
 IDLE_SAMPLES = 5
 SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
@@ -150,13 +150,16 @@ def registered_by(trace, name):
     return {n for p, n in trace['registered'] if p in pids}
 
 
+PRE_SD_BOOT2 = {'psc', 'pcie', 'Bus', 'settings', 'pcv', 'usb'}   # boot2_api LaunchPreSdCardBootProgramsAndBoot2
+
+
 def ams_checks(trace, log):
     names = set(trace['procs'].values())
     set_version = [(a, r) for sid, a, r in user_smc_calls(trace) if sid == 0xC3000401 and a.get(1) == '0xfde8']
-    boot = pids_named(trace, 'boot')
-    boot_ports = [n for p, what, n in trace['ports'] if p in boot and what == 'ConnectToNamedPort']
+    boot, mitm = pids_named(trace, 'boot'), pids_named(trace, 'ams.mitm')
+    pcv = pids_named(trace, 'pcv')
     return [
-        ('7 INI1 processes started', names == {'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl', 'FS'}),
+        ('8 INI1 processes started', {'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl', 'ams.mitm', 'FS'} <= names),
         ('FS drives the eMMC (SDMMC4 MMIO)', 'sdmmc' in trace['mmio']),
         ('FS registers fsp-srv fsp-pr fsp-ldr', {'fsp-srv', 'fsp-pr', 'fsp-ldr'} <= registered_by(trace, 'FS')),
         ('spl registers its services', SPL_SERVICES <= registered_by(trace, 'spl')),
@@ -166,8 +169,15 @@ def ams_checks(trace, log):
         ('loader registers ldr:pm ldr:shel ldr:dmnt', {'ldr:pm', 'ldr:shel', 'ldr:dmnt'} <= registered_by(trace, 'Loader')),
         ('pm registers pm:shell pm:dmnt pm:bm pm:info',
          {'pm:shell', 'pm:dmnt', 'pm:bm', 'pm:info'} <= registered_by(trace, 'ProcessMana')),
-        ('frontier: boot waits for bpc:ams (ams_mitm is F3)', boot_ports.count('bpc:ams') >= 2),
-        ('no process exited', 'KProcess::Exit()' not in log and 'KProcess::Terminate()' not in log),
+        ('ams_mitm serves bpc:ams', any(p in mitm and what == 'ManageNamedPort' and n == 'bpc:ams'
+                                        for p, what, n in trace['ports'])),
+        ('boot initializes I2C/GPIO/PWM/display and notifies pm:shell (NotifyBootFinished)',
+         {'i2c', 'gpio', 'pwm', 'host1x_modules'} <= set(trace['mmio'])
+         and any(p in boot and n == 'pm:shell' for p, n in trace['lookups'])),
+        ('pm launches psc pcie Bus settings pcv usb', PRE_SD_BOOT2 <= names),
+        ('frontier: pcv waits for fatal:u (it aborts on the bootloader state it reads)',
+         any(p in pcv and d == 'sm GetServiceHandle(fatal:u)' for (p, _), (_, d) in trace['pending'].items())),
+        ('no process crashed', 'KProcess::Terminate()' not in log),
     ]
 
 
