@@ -16,14 +16,21 @@ KERNEL_ELF = os.path.join(ROOT, 'third_party/Atmosphere/mesosphere/kernel/out/ni
 BIN = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-')
 KERNEL_STATE_INITIALIZED = 2   # Kernel::State (kern_kernel.hpp)
 PROFILES = ('empty', 'core', 'ams', 'stock')
-SETTLE = {'empty': 5, 'core': 8, 'ams': 20, 'stock': 10}     # seconds after the kernel layout / READY
+SETTLE = {'empty': 5, 'core': 8, 'ams': 20, 'stock': 20}     # seconds after the kernel layout / READY
 # Line that marks a profile's userland milestone, in the trace (smc lines are flushed as they happen) or on the
-# UART: pm starting usb, the last pre-SD boot2 program (ams); Nintendo's boot exiting after NotifyBootFinished.
-READY = {'ams': ('uart', r'KProcess::Run\(\) pid=\d+ name=usb'),
-         'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot')}
-EXTRA_ALLOWED = {'ams': hvm_log.ALLOWED_BOOT_HW, 'stock': hvm_log.ALLOWED_BOOT_HW}
+# UART: boot2 exiting once it has launched its whole list (Atmosphère's from the SD, Nintendo's ProdBoot).
+READY = {'ams': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot2'),
+         'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot2')}
+EXTRA_ALLOWED = {'ams': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2),
+                 'stock': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2)}
+# Known frontier: sysmodules that crash on the synthetic console (program ids).
+EXPECTED_CRASHES = {'ams': {'010000000000002b'},                          # erpt
+                    'stock': {'010000000000002b', '0100000000000034'}}    # erpt, fatal
 LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
 IDLE_SAMPLES = 5
+# Cores that must reach WFI. With boot2's sysmodules up, core 3 (their only core) stays busy: nvservices polls
+# its GPU events in a loop (the GPU is not emulated).
+IDLE_CORES = {'ams': {0, 1, 2}, 'stock': {0, 1, 2}}
 SPL_SERVICES = {'spl:', 'csrng', 'spl:mig', 'spl:fs', 'spl:ssl', 'spl:es', 'spl:manu'}   # spl_main.cpp, fw >= 5.0.0
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
@@ -109,7 +116,7 @@ def smoke(soc, ini, nand, timeout, persist=False):
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'qemu-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'uart-%s.log' % soc),
-                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})))
+                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})), EXPECTED_CRASHES.get(ini, ()))
     for v in trace['violations']:
         print('%-7s %-5s %-5s trace: %s' % (soc, ini, nand or '', v))
     return [
@@ -118,7 +125,8 @@ def smoke(soc, ini, nand, timeout, persist=False):
         ('kernel banner', 'Horizon Kernel (Mesosphere)' in log),
         ('no kernel panic', 'Kernel Panic' not in log),
         ('Kernel::s_state == Initialized', bool(state) and int(state.group(1), 16) == KERNEL_STATE_INITIALIZED),
-        ('4 cores idle in WFI', idle_cores == {0, 1, 2, 3}),
+        ('cores %s idle in WFI' % ','.join(map(str, sorted(IDLE_CORES.get(ini, {0, 1, 2, 3})))),
+         IDLE_CORES.get(ini, {0, 1, 2, 3}) <= idle_cores),
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
     ] + profile_checks(soc, ini, trace, log) + writeback_checks(soc, ini, nand, persist)
@@ -175,9 +183,11 @@ def ams_checks(trace, log):
          {'i2c', 'gpio', 'pwm', 'host1x_modules'} <= set(trace['mmio'])
          and any(p in boot and n == 'pm:shell' for p, n in trace['lookups'])),
         ('pm launches psc pcie Bus settings pcv usb', PRE_SD_BOOT2 <= names),
-        ('frontier: pcv waits for fatal:u (it aborts on the bootloader state it reads)',
-         any(p in pcv and d == 'sm GetServiceHandle(fatal:u)' for (p, _), (_, d) in trace['pending'].items())),
-        ('no process crashed', 'KProcess::Terminate()' not in log),
+        ('pcv initializes (no fatal:u) and serves clkrst: pcie registers pcie',
+         not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups']) and 'pcie' in registered_by(trace, 'pcie')),
+        ('ams_mitm mounts the SD: pm launches Atmosphère boot2 from stratosphere.romfs, and it launches memlet',
+         {'boot2', 'memlet'} <= names),
+        ('crashes: only the known frontier (erpt)', set(trace['crashes']) <= EXPECTED_CRASHES['ams']),
     ]
 
 
@@ -189,6 +199,7 @@ def stock_checks(trace, log, ncm_db):
     names = set(trace['procs'].values())
     boot = pids_named(trace, 'boot')
     pm = pids_named(trace, 'ProcessMana')
+    pcv = pids_named(trace, 'pcv')
     return [
         ('the 7 official INI1 processes started', {'FS', 'Loader', 'NCM', 'ProcessMana', 'sm', 'boot', 'spl'} <= names),
         ('FS drives the eMMC and registers fsp-srv fsp-pr fsp-ldr',
@@ -204,6 +215,10 @@ def stock_checks(trace, log, ncm_db):
     ] + ([
         ('with the ncm DB on the NAND, pm launches boot2 and it starts psc settings usb pcie Bus pcv',
          BOOT2_MODULES <= names),
+        ('pcv initializes (no fatal:u); boot2 goes past omm: am nvservices vi ns hid audio',
+         not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups'])
+         and {'am', 'nvservices', 'vi', 'ns', 'hid', 'audio'} <= names),
+        ('crashes: only the known frontier (erpt, fatal)', set(trace['crashes']) <= EXPECTED_CRASHES['stock']),
     ] if ncm_db else [
         ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
          any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND

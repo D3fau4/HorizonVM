@@ -761,6 +761,20 @@ class TestHvmLog(unittest.TestCase):
                      "Abort: 'R_SUCCEEDED(rc)' in Main, process=0x02, thread=5 (main)\n"):
             self.assertTrue(self.analyze(self.GOOD, uart=uart)['violations'], uart)
 
+    def test_expected_crash(self):
+        uart = self.UART + 'erpt: svc::Break(0) was called, pid=3\nBreak() called. 010000000000002b\n'
+        self.assertIn('UART: Break() called 010000000000002b', self.analyze(self.GOOD, uart=uart)['violations'])
+        d = tempfile.mkdtemp()
+        try:
+            paths = [os.path.join(d, n) for n in 'tqu']
+            for path, text in zip(paths, (self.GOOD, self.QEMU, uart)):
+                with open(path, 'w') as f:
+                    f.write(text)
+            r = hvm_log.analyze(*paths, expected_crashes={'010000000000002b'})
+            self.assertEqual((r['violations'], r['crashes']), ([], {'010000000000002b': 'Break() called'}))
+        finally:
+            shutil.rmtree(d)
+
 
 if __name__ == '__main__':
     unittest.main()

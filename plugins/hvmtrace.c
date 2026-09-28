@@ -1,11 +1,14 @@
 /*
  * hvmtrace: QEMU TCG plugin logging AArch64 SMC calls/returns, EL0 SVCs and MMIO accesses for HorizonVM.
- * usage: -plugin libhvmtrace.so,out=<file>[,mmio=off][,smc=off][,svc=off]
+ * usage: -plugin libhvmtrace.so,out=<file>[,mmio=off][,smc=off][,svc=off][,watch_pid=N,watch=off1:off2:...]
  * Secrets are redacted at the source: SE/SE2/PKA1 MMIO values, crypto SMC arguments/results. Of IPC messages
  * only the header is decoded (command id, result code); payloads are dumped only for sm (service names, handles).
+ * watch= is a reverse-engineering aid: x0-x30 of process watch_pid at code offsets (pc & 0x1FFFFF, the module
+ * base is 2 MiB aligned). Never point it at a process that handles key material (spl, FS, ...).
  */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <glib.h>
 #include <qemu-plugin.h>
@@ -21,6 +24,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define SVC_SEND_SYNC_REQUEST_WITH_USER_BUF 0x22
 #define SVC_MANAGE_NAMED_PORT               0x71
 #define SM_MSG_LOG_SIZE                     0x40
+#define BACKTRACE_DEPTH                     12
 #define IPC_HEADER_READ                     0x80
 
 static FILE *out;
@@ -30,9 +34,12 @@ static GHashTable *svc_returns;   /* same for EL0 svc */
 static GHashTable *svc_pending;   /* thread key -> SvcCall, for calls that have not returned yet */
 static GHashTable *sm_sessions;   /* (pid, handle) of sessions to the "sm:" port */
 static bool log_mmio = true, log_smc = true, log_svc = true;
+static uint64_t watch_pid;
+static GHashTable *watch_offsets;
+#define WATCH_OFFSET_MASK 0x1FFFFF
 
 typedef struct {
-    struct qemu_plugin_register *x[8], *cpsr, *contextidr, *tpidrro;
+    struct qemu_plugin_register *x[31], *cpsr, *contextidr, *tpidrro;
     uint64_t pending_ret, pending_id, pending_imm;
 } VcpuState;
 static VcpuState vcpus[MAX_VCPUS];
@@ -256,6 +263,30 @@ static bool ipc_decode(uint64_t va, bool reply, int *kind, uint32_t *value)
     return false;
 }
 
+/* Return addresses of the caller chain (lr, then the frame-pointer chain): code addresses only, no data. */
+static void append_backtrace(GString *line, VcpuState *s)
+{
+    if (!s->x[29] || !s->x[30]) {
+        return;
+    }
+    uint64_t fp = read_reg(s->x[29]);
+    g_string_append_printf(line, " bt=0x%" PRIx64, read_reg(s->x[30]));
+    for (int depth = 0; depth < BACKTRACE_DEPTH && fp && !(fp & 0xF); depth++) {
+        g_autoptr(GByteArray) frame = g_byte_array_new();
+        uint64_t next, ret;
+        if (!qemu_plugin_read_memory_vaddr(fp, frame, 16) || frame->len < 16) {
+            break;
+        }
+        memcpy(&next, frame->data, 8);
+        memcpy(&ret, frame->data + 8, 8);
+        if (!ret || next <= fp) {
+            break;
+        }
+        g_string_append_printf(line, ",0x%" PRIx64, ret);
+        fp = next;
+    }
+}
+
 static void on_svc(unsigned int cpu, void *udata)
 {
     if (!is_aarch64_vcpu(cpu)) {
@@ -309,6 +340,7 @@ static void on_svc(unsigned int cpu, void *udata)
         if (sm_session) {
             /* Only sm requests are dumped: they carry service names, never key material. */
             append_user_hex(line, "sm_msg", call->msg_va, SM_MSG_LOG_SIZE);
+            append_backtrace(line, s);
         }
     }
     emit(line, false);
@@ -384,12 +416,32 @@ static void on_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
     g_mutex_unlock(&lock);
 }
 
+static void on_watch(unsigned int cpu, void *udata)
+{
+    if (!is_aarch64_vcpu(cpu)) {
+        return;
+    }
+    VcpuState *s = &vcpus[cpu];
+    if ((read_reg(s->contextidr) & 0xFFFFFFFF) != watch_pid || ((read_reg(s->cpsr) >> 2) & 3) != 0) {
+        return;
+    }
+    GString *line = g_string_new(NULL);
+    g_string_append_printf(line, "watch cpu=%u pid=%" PRIu64 " off=0x%" PRIx64, cpu, watch_pid,
+                           (uint64_t)(uintptr_t)udata & WATCH_OFFSET_MASK);
+    append_regs(line, s, 0, 30, true);
+    emit(line, false);
+}
+
 static void on_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     for (size_t i = 0; i < qemu_plugin_tb_n_insns(tb); i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t va = qemu_plugin_insn_vaddr(insn);
         void *udata = (void *)(uintptr_t)va;
+        if (watch_pid && va < 0x8000000000ULL &&
+            g_hash_table_contains(watch_offsets, (gpointer)(uintptr_t)(va & WATCH_OFFSET_MASK))) {
+            qemu_plugin_register_vcpu_insn_exec_cb(insn, on_watch, QEMU_PLUGIN_CB_R_REGS, udata);
+        }
         if (log_mmio) {
             qemu_plugin_register_vcpu_mem_cb(insn, on_mem, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, udata);
         }
@@ -431,8 +483,10 @@ static void on_vcpu_init(qemu_plugin_id_t id, unsigned int cpu)
     VcpuState *s = &vcpus[cpu];
     for (guint i = 0; i < regs->len; i++) {
         qemu_plugin_reg_descriptor *d = &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-        if (d->name[0] == 'x' && d->name[1] >= '0' && d->name[1] <= '7' && d->name[2] == '\0') {
-            s->x[d->name[1] - '0'] = d->handle;
+        char *end;
+        long n = d->name[0] == 'x' ? strtol(d->name + 1, &end, 10) : -1;
+        if (n >= 0 && n <= 30 && end != d->name + 1 && *end == '\0') {
+            s->x[n] = d->handle;
         } else if (!strcmp(d->name, "cpsr")) {
             s->cpsr = d->handle;
         } else if (!strcmp(d->name, "CONTEXTIDR_EL1")) {
@@ -468,11 +522,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             log_smc = strcmp(kv[1], "off") != 0;
         } else if (!strcmp(kv[0], "svc")) {
             log_svc = strcmp(kv[1], "off") != 0;
+        } else if (!strcmp(kv[0], "watch_pid")) {
+            watch_pid = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (!strcmp(kv[0], "watch")) {
+            g_auto(GStrv) offs = g_strsplit(kv[1], ":", -1);
+            watch_offsets = watch_offsets ? watch_offsets : g_hash_table_new(g_direct_hash, g_direct_equal);
+            for (int j = 0; offs[j]; j++) {
+                g_hash_table_add(watch_offsets, (gpointer)(uintptr_t)(g_ascii_strtoull(offs[j], NULL, 16) & WATCH_OFFSET_MASK));
+            }
         }
     }
     if (!path || !(out = fopen(path, "w"))) {
         fprintf(stderr, "hvmtrace: need a writable out=<file>\n");
         return -1;
+    }
+    if (watch_pid && !watch_offsets) {
+        watch_pid = 0;
     }
     setvbuf(out, NULL, _IOFBF, 1 << 20);
     smc_returns = g_hash_table_new(g_direct_hash, g_direct_equal);

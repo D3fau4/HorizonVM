@@ -31,15 +31,18 @@ while [ $# -gt 0 ]; do
         --display) DISPLAY_ARGS=(-display none -vnc "127.0.0.1:$((${HVM_VNC:-5900} - 5900))")
                    echo "display: VNC on 127.0.0.1:${HVM_VNC:-5900}" >&2; shift ;;
         --gdb) GDB=(-s -S); shift ;;
-        --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log"); shift ;;
+        --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log${HVM_TRACE_ARGS:+,$HVM_TRACE_ARGS}"); shift ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
+# PMIC state fusee leaves behind (fusee_cpu.cpp: pmic::EnableVddCpu, VDD_CPU at 0.95 V), which pcv reads back.
 case "$SOC" in
-    erista) MACHINE=tegrax1 ;;
-    mariko) MACHINE=tegrax1plus ;;
+    erista) MACHINE=tegrax1
+            BOOT_REGS="1b.00=b7;1b.01=b7;1b.02=b0;1b.03=c1;3c.3b=09;3c.27=00" ;;   # MAX77621 VOUT/DVC/CTRL1/2, MAX77620 GPIO5, LDO2 off
+    mariko) MACHINE=tegrax1plus
+            BOOT_REGS="31.06=40;31.26=6e;3c.27=00" ;;                   # MAX77812 EN_CTRL, M4VOUT, MAX77620 LDO2 off
     *) echo "unknown soc: $SOC" >&2; exit 2 ;;
 esac
 
@@ -106,13 +109,16 @@ python3 "$ROOT/tools/mkexo0.py" -o "$HVM/run/exo0-$SOC.bin" "${EXO0_ARGS[@]}"
 
 # Replaces fusee: 0x400000F8 is SecureMonitorParameters.bootloader_state (4 = BootloaderState_Done),
 # 0xA9800000 is where exosphere expects the plaintext package2 (secmon_memory_layout.hpp),
-# 0x8000F000 is the EXO0 storage configuration (secmon_monitor_context.hpp).
+# 0x8000F000 is the EXO0 storage configuration (secmon_monitor_context.hpp); SPARE_REG0 = CLK_M divisor 2
+# (fusee_secure_initialize.cpp InitializeClock, required by pcv).
 exec "$ROOT/build/qemu/qemu-system-aarch64" \
     -machine "$MACHINE" -m 8G "${DISPLAY_ARGS[@]}" \
     -chardev "stdio,id=uart,mux=on,logfile=$HVM/logs/uart-$SOC.log" -serial chardev:uart -mon chardev=uart \
     -global driver=tegra.evp,property=cpu-reset-vector,value=0x40030000 \
     -global driver=tegra.flow,property=cop-halted,value=on \
     -global "driver=tegra.gpio,property=reset-value-bank5-port3,value=$BUTTONS" \
+    -global driver=tegra.car,property=spare-reg0,value=4 \
+    -global "driver=max77xpmic,property=boot-regs,value=$BOOT_REGS" \
     -device "loader,addr=0x40030000,force-raw=on,file=$AMS/exosphere/out/$OUT/exosphere.bin" \
     -device "loader,addr=0xA9800000,force-raw=on,file=$PKG2" \
     -device "loader,addr=0x8000F000,force-raw=on,file=$HVM/run/exo0-$SOC.bin" \

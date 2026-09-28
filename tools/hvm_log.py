@@ -25,7 +25,9 @@ DEVICES = [
     (0x7000F800, 0x800, 'fuse'), (0x70012000, 0x2000, 'se'), (0x70014000, 0x1000, 'tsensor'),
     (0x70019000, 0x1000, 'mc'), (0x7001B000, 0x5000, 'emc/mc01'), (0x700B0000, 0x800, 'sdmmc'),
     (0x700E3000, 0x100, 'mipi_cal'), (0x700F0000, 0x10000, 'sysctr0'), (0x70100000, 0x10000, 'sysctr1'), (0x70412000, 0x2000, 'se2'),
-    (0x70420000, 0x10000, 'pka1'),
+    (0x70420000, 0x10000, 'pka1'), (0x01000000, 0x4000, 'pcie'), (0x58000000, 0x1000000, 'gpu_bar1'),
+    (0x60021000, 0x1000, 'apb_dma_ch'), (0x7009F000, 0x1000, 'xusb_padctl'), (0x700E2000, 0x1000, 'soc_therm'),
+    (0x70110000, 0x400, 'cl_dvfs'),
 ]
 
 # Devices exosphere, the NX kernel and the INI1 processes are expected to touch (and why).
@@ -43,6 +45,10 @@ ALLOWED = {
 # display/DSI); allowed only for INI1 profiles that run it (stock, and ams once ams_mitm serves bpc:ams).
 ALLOWED_BOOT_HW = {'i2c': 'boot: PMIC/charger/fuel gauge', 'gpio': 'boot: GPIO config', 'pwm': 'boot: backlight',
                    'host1x_modules': 'boot: display (DC/DSI)', 'mipi_cal': 'boot: DSI pad calibration'}
+# What the boot2 sysmodules drive once pcv is up (clkrst/regulators answer).
+ALLOWED_BOOT2 = {'cl_dvfs': 'pcv: CPU DFLL', 'soc_therm': 'pcv/ptm: thermal', 'pcie': 'pcie', 'xusb_padctl': 'usb',
+                 'gpu': 'nvservices', 'gpu_bar1': 'nvservices', 'spi': 'hid: touch screen',
+                 'apb_dma': 'Bus: UART/I2C/SPI DMA', 'apb_dma_ch': 'Bus: UART/I2C/SPI DMA'}
 
 # exosphere dispatches on the smc immediate (secmon_smc_handler.cpp): 1 = kernel table, 0 = user table.
 SMC_NAMES = {
@@ -81,7 +87,9 @@ EXC_ALLOWED = {('IRQ', 'EL0', 'EL1'), ('IRQ', 'EL1', 'EL1'), ('SVC', 'EL0', 'EL1
 EC_FP_ACCESS = 0x7
 # Kernel panics, kernel dumps of crashed user processes, svc::Break, and stratosphere aborts/asserts
 # (diag_default_abort_observer.cpp: "<reason>: '<expr>' in <func>, process=0x..").
-UART_BAD = re.compile(r"Kernel Panic|Exception occurred|svc::Break|: '[^'\n]*' in \S+, process=0x")
+UART_BAD = re.compile(r"Kernel Panic|: '[^'\n]*' in \S+, process=0x")
+# Mesosphere's user crash reports (exception or svc::Break), followed by the program id.
+CRASH_RE = re.compile(r'(Exception occurred|Break\(\) called)\. ([0-9a-f]{16})')
 
 SMC_RE = re.compile(r'^(smc|smc_ret) cpu=(\d+) el=(\d+) pc=0x([0-9a-f]+) imm=(\d+) id=0x([0-9a-f]+)(.*)$')
 SVC_RE = re.compile(r'^(svc|svc_ret) cpu=(\d+) pid=(\d+) tls=0x([0-9a-f]+) pc=0x[0-9a-f]+ id=0x([0-9a-f]+)(.*)$')
@@ -153,7 +161,8 @@ def regs_of(rest):
     return dict((int(i), v) for i, v in REGS_RE.findall(rest))
 
 
-def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
+def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, expected_crashes=()):
+    """expected_crashes: program ids (hex) whose crash is a known frontier; their EL0 faults are not violations."""
     smc, smc_ret, smc_el, mmio = collections.Counter(), collections.Counter(), collections.Counter(), {}
     user_smc, user_smc_cores, leaks = [], collections.Counter(), []
     svc = collections.Counter()
@@ -240,25 +249,30 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
                     name = 'FP access'
                 exc[(name, frm, to)] += 1
 
-    procs, uart_bad = {}, []
+    procs, uart_bad, crashes = {}, [], {}
     if uart_path and os.path.exists(uart_path):
         with open(uart_path, errors='replace') as f:
             uart = f.read()
         procs = {int(p): n for p, n in PROC_RE.findall(uart)}
         uart_bad = sorted({m.group(0) for m in UART_BAD.finditer(uart)})
+        crashes = {prog: kind for kind, prog in CRASH_RE.findall(uart)}
+    expected = set(expected_crashes) & set(crashes)
 
     violations = []
     violations += ['unknown SMC imm=%d id=%#x' % k for k in smc if k not in SMC_NAMES]
     violations += ['SMC issued from EL%d' % el for el in smc_el if el != 1]
     violations += ['user SMC issued on core %d (exosphere requires core 3)' % c for c in user_smc_cores if c != 3]
     violations += ['MMIO to %s (not in allowlist)' % d for d in mmio if d not in allowed]
+    el0_fault_expected = any(crashes[p] == 'Exception occurred' for p in expected)
     violations += ['exception %s %s->%s' % e for e in exc
-                   if e not in EXC_ALLOWED and e != ('FP access', 'EL0', 'EL1')]
+                   if e not in EXC_ALLOWED and e != ('FP access', 'EL0', 'EL1')
+                   and not (el0_fault_expected and e[1:] == ('EL0', 'EL1'))]
     violations += ['UART: %s' % b for b in uart_bad]
+    violations += ['UART: %s %s' % (kind, prog) for prog, kind in sorted(crashes.items()) if prog not in expected]
     violations += sorted(set(leaks))
     return {'allowed': allowed, 'smc': smc, 'smc_ret': smc_ret, 'mmio': mmio, 'exc': exc, 'violations': violations,
             'svc': svc, 'procs': procs, 'ports': ports, 'registered': registered, 'lookups': lookups,
-            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures}
+            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures, 'crashes': crashes}
 
 
 def proc_name(r, pid):

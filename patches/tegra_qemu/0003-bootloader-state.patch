@@ -1,0 +1,80 @@
+Opt-in bootloader state that HorizonVM's host-side boot (no fusee) must provide:
+- tegra.car 'spare-reg0': CLK_RST_CONTROLLER_SPARE_REG0 as fusee leaves it (CLK_M divisor 2); pcv aborts otherwise.
+- max77xpmic 'boot-regs' ("addr.reg=val;..."): PMIC/regulator registers as fusee leaves them (VDD_CPU on at 0.95 V,
+  SD LDO2 off); pcv's DVFS and regulator code read them back.
+
+diff --git a/hw/arm/tegra2/ppsb/car/car.c b/hw/arm/tegra2/ppsb/car/car.c
+index 26edcb6..2a37d57 100644
+--- a/hw/arm/tegra2/ppsb/car/car.c
++++ b/hw/arm/tegra2/ppsb/car/car.c
+@@ -154,6 +154,7 @@ typedef struct tegra_car_state {
+     DEFINE_REG32(rst_controller_pllc4_base);
+     DEFINE_REG32(rst_controller_pllmb_base);
+     uint32_t regs[0x78C>>2];
++    uint32_t spare_reg0;
+ } tegra_car;
+ 
+ static const VMStateDescription vmstate_tegra_car = {
+@@ -2030,6 +2031,7 @@ static void tegra_car_priv_reset(DeviceState *dev)
+                 }
+             }
+         }
++        if (s->spare_reg0) tegra_car_priv_write(s, 0x55C, s->spare_reg0, 4); // As left by the bootloader (e.g. fusee: CLK_M divisor 2).
+ 
+         s->osc_freq_det_status.osc_freq_det_cnt = 2344;
+ 
+@@ -2064,10 +2066,16 @@ static void tegra_car_priv_realize(DeviceState *dev, Error **errp)
+     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+ }
+ 
++static Property tegra_car_properties[] = {
++    DEFINE_PROP_UINT32("spare-reg0", tegra_car, spare_reg0, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void tegra_car_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
++    device_class_set_props(dc, tegra_car_properties);
+     dc->realize = tegra_car_priv_realize;
+     dc->vmsd = &vmstate_tegra_car;
+     device_class_set_legacy_reset(dc, tegra_car_priv_reset);
+diff --git a/hw/misc/max77xpmic.c b/hw/misc/max77xpmic.c
+index e146b5b..2a97dc6 100644
+--- a/hw/misc/max77xpmic.c
++++ b/hw/misc/max77xpmic.c
+@@ -30,6 +30,7 @@ struct MAX77XPMICState {
+     I2CSlave parent_obj;
+     int8_t addr;
+     uint32_t version;
++    char *boot_regs;
+ 
+     uint8_t regs[0x71];
+ };
+@@ -75,6 +76,17 @@ static void max77xpmic_realize(DeviceState *dev, Error **errp)
+     s->regs[0x42] = 0x07; // ONOFFCNFG2
+ 
+     s->regs[0x5C] = s->version; // REG_CID4
++
++    // Registers as left by the bootloader: "addr.reg=val;..." (hex), entries for other addresses are ignored.
++    if (s->boot_regs) {
++        g_auto(GStrv) items = g_strsplit(s->boot_regs, ";", -1);
++        for (int i = 0; items[i]; i++) {
++            unsigned int a, r, v;
++            if (sscanf(items[i], "%x.%x=%x", &a, &r, &v) == 3 && a == s->parent_obj.address && r < sizeof(s->regs)) {
++                s->regs[r] = v;
++            }
++        }
++    }
+ }
+ 
+ static int max77xpmic_send(I2CSlave *i2c, uint8_t data)
+@@ -165,6 +177,7 @@ static int max77xpmic_event(I2CSlave *i2c, enum i2c_event event)
+ 
+ static Property max77xpmic_properties[] = {
+     DEFINE_PROP_UINT32("version", MAX77XPMICState, version, 0x35),
++    DEFINE_PROP_STRING("boot-regs", MAX77XPMICState, boot_regs),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
