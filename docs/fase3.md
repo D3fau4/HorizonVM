@@ -29,7 +29,33 @@ No parchear Atmosphère; parches neutros de tegra_qemu solo si hace falta; un co
 sin push; secretos solo en `~/.horizonvm` (0700/0600); nunca imprimir ni versionar claves; el firmware de
 Nintendo nunca entra en el repo; decisiones de diseño, consultar al usuario.
 
-## Plan aprobado
+## Cambios respecto al plan aprobado
+- `--display`: el QEMU compilado no tiene GTK/SDL; es VNC en 127.0.0.1:5900 (`HVM_VNC` cambia el puerto).
+- dist: el objetivo real es `make dist-no-debug-nx_release`; `haze` se compila antes porque su regla de shaders
+  falla con `-j`.
+- M19: la causa no eran los fuses. pcv necesitaba tres estados que deja fusee: CAR `SPARE_REG0`=4 (divisor
+  CLK_M), VDD_CPU a 0,95 V (MAX77621 en Erista / MAX77812 en Mariko) y el LDO2 de la SD apagado. Parche
+  `patches/tegra_qemu/0003-bootloader-state.patch` (propiedades `tegra.car.spare-reg0` y
+  `max77xpmic.boot-regs`, fijadas por `run.sh` por SoC). `mkfuses.py` no cambia.
+- El smoke de `ams`/`stock` exige WFI solo en los cores 0–2 (el 3 lo ocupa nvservices) y admite caídas conocidas
+  por program id (`EXPECTED_CRASHES`).
+- Fuga corregida (b19adbd): la SVC CallSecureMonitor (0x7F) ahora sigue la misma redacción que las SMC.
+- M20, según prodinfo_gen (CaramelDunes):
+  - bloques opcionales sin CRC (ausentes);
+  - DeviceId `NX%016X-0` con prefijo 0x63 en EccB233 y Rsa2048ETicket;
+  - `SslCertificateSize`=0x5E9;
+  - valores por defecto de calibración cuando no hay referencia.
+- M20: `ExtendedRsa2048ETicketKey` válida (clave RSA por identidad en `identity/<soc>/eticket_rsa.der`, cifrada como
+  la descifra exosphere en ImportEsDeviceKey). Requiere `eticket_rsa_kek_source` y `eticket_rsa_kekek_source`
+  en `prod.keys` (el usuario ya las añadió). Sin ella, el exosphere debug hace assert en el GCM y reinicia por WDT.
+- M20: `erpt` caía por saves de settings con PlatformRegion=0, creados con el CAL0 en blanco. Se vació
+  `SYSTEM/save` de Erista (con permiso del usuario) y se regeneró con `ams --nand dir --persist`.
+- Decisiones del usuario:
+  - lista blanca del CAL0: tal cual se propuso;
+  - serial: retail realista (`XAW1`/`XKW1` + dígito de control);
+  - `settings`: investigar en vez de fabricar saves.
+
+## Plan aprobado (original, sin modificar)
 
 ### HorizonVM, fase 3: ams_mitm, SD sintética, desbloqueo de pcv y CAL0 generado
 
