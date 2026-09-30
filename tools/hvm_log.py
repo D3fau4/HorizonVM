@@ -25,8 +25,13 @@ DEVICES = [
     (0x7000F800, 0x800, 'fuse'), (0x70012000, 0x2000, 'se'), (0x70014000, 0x1000, 'tsensor'),
     (0x70019000, 0x1000, 'mc'), (0x7001B000, 0x5000, 'emc/mc01'), (0x700B0000, 0x800, 'sdmmc'),
     (0x700E3000, 0x100, 'mipi_cal'), (0x700F0000, 0x10000, 'sysctr0'), (0x70100000, 0x10000, 'sysctr1'), (0x70412000, 0x2000, 'se2'),
-    (0x70420000, 0x10000, 'pka1'),
+    (0x70420000, 0x10000, 'pka1'), (0x01000000, 0x4000, 'pcie'), (0x58000000, 0x1000000, 'gpu_bar1'),
+    (0x60021000, 0x1000, 'apb_dma_ch'), (0x7009F000, 0x1000, 'xusb_padctl'), (0x700E2000, 0x1000, 'soc_therm'),
+    (0x70110000, 0x400, 'cl_dvfs'), (0x702C0000, 0x40000, 'ape'), (0x70030000, 0x10000, 'hda'),
 ]
+# The APE's Cortex-A9 (tegrax1.c: "APE is cpu5") runs the ADSP firmware audio loads, in its own address space
+# (ARAM, A9 private region and L2 at 0xC00000, an APE mirror): its accesses are classified by CPU, not address.
+ADSP_CPU = 5
 
 # Devices exosphere, the NX kernel and the INI1 processes are expected to touch (and why).
 ALLOWED = {
@@ -40,9 +45,14 @@ ALLOWED = {
     'sdmmc': 'FS eMMC driver (SDMMC4)',
 }
 # Hardware Nintendo's boot sysmodule initializes (PMIC/charger/fuel gauge over I2C, GPIO, backlight PWM,
-# display/DSI); allowed only for INI1 profiles that run it (Atmosphère's boot stops at bpc:ams before this).
+# display/DSI); allowed only for INI1 profiles that run it (stock, and ams once ams_mitm serves bpc:ams).
 ALLOWED_BOOT_HW = {'i2c': 'boot: PMIC/charger/fuel gauge', 'gpio': 'boot: GPIO config', 'pwm': 'boot: backlight',
                    'host1x_modules': 'boot: display (DC/DSI)', 'mipi_cal': 'boot: DSI pad calibration'}
+# What the boot2 sysmodules drive once pcv is up (clkrst/regulators answer).
+ALLOWED_BOOT2 = {'cl_dvfs': 'pcv: CPU DFLL', 'soc_therm': 'pcv/ptm: thermal', 'pcie': 'pcie', 'xusb_padctl': 'usb',
+                 'gpu': 'nvservices', 'gpu_bar1': 'nvservices', 'spi': 'hid: touch screen',
+                 'apb_dma': 'Bus: UART/I2C/SPI DMA', 'apb_dma_ch': 'Bus: UART/I2C/SPI DMA',
+                 'ape': 'audio: AHUB/ADMA', 'hda': 'audio: HDA', 'adsp': 'audio: ADSP firmware (cpu 5)'}
 
 # exosphere dispatches on the smc immediate (secmon_smc_handler.cpp): 1 = kernel table, 0 = user table.
 SMC_NAMES = {
@@ -56,6 +66,9 @@ SMC_NAMES = {
     (0, 0xC300D60C): 'ReencryptDeviceUniqueData', (0, 0xC300100D): 'DecryptDeviceUniqueData',
     (0, 0xC300060F): 'ModularExponentiateByStorageKey', (0, 0xC3000610): 'PrepareEsDeviceUniqueKey',
     (0, 0xC3000011): 'LoadPreparedAesKey', (0, 0xC3000012): 'PrepareEsCommonTitleKey',
+    # Atmosphère extensions (secmon_smc_handler.cpp): boot's PMC access, ams_mitm's emummc query.
+    (0, 0xF0000201): 'IramCopy', (0, 0xF0000002): 'ReadWriteRegister', (0, 0xF0000003): 'WriteAddress',
+    (0, 0xF0000404): 'GetEmummcConfig',
 }
 SMC_ARGS_PUBLIC = {k for k in SMC_NAMES if k[0] == 1} | {(0, 0xC3000002), (0, 0xC3000401)}   # = hvmtrace.c
 SMC_RESULTS_PUBLIC = SMC_ARGS_PUBLIC - {(1, 0xC3000005)}
@@ -78,7 +91,9 @@ EXC_ALLOWED = {('IRQ', 'EL0', 'EL1'), ('IRQ', 'EL1', 'EL1'), ('SVC', 'EL0', 'EL1
 EC_FP_ACCESS = 0x7
 # Kernel panics, kernel dumps of crashed user processes, svc::Break, and stratosphere aborts/asserts
 # (diag_default_abort_observer.cpp: "<reason>: '<expr>' in <func>, process=0x..").
-UART_BAD = re.compile(r"Kernel Panic|Exception occurred|svc::Break|: '[^'\n]*' in \S+, process=0x")
+UART_BAD = re.compile(r"Kernel Panic|: '[^'\n]*' in \S+, process=0x")
+# Mesosphere's user crash reports (exception or svc::Break), followed by the program id.
+CRASH_RE = re.compile(r'(Exception occurred|Break\(\) called)\. ([0-9a-f]{16})')
 
 SMC_RE = re.compile(r'^(smc|smc_ret) cpu=(\d+) el=(\d+) pc=0x([0-9a-f]+) imm=(\d+) id=0x([0-9a-f]+)(.*)$')
 SVC_RE = re.compile(r'^(svc|svc_ret) cpu=(\d+) pid=(\d+) tls=0x([0-9a-f]+) pc=0x[0-9a-f]+ id=0x([0-9a-f]+)(.*)$')
@@ -150,7 +165,9 @@ def regs_of(rest):
     return dict((int(i), v) for i, v in REGS_RE.findall(rest))
 
 
-def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
+def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, expected_crashes=()):
+    """expected_crashes: program ids (hex) whose crash is a known frontier, or a function of the crashes in UART order
+    returning them; their EL0 faults are not violations."""
     smc, smc_ret, smc_el, mmio = collections.Counter(), collections.Counter(), collections.Counter(), {}
     user_smc, user_smc_cores, leaks = [], collections.Counter(), []
     svc = collections.Counter()
@@ -160,12 +177,22 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
     handles = {}          # (pid, handle) -> service name, from sm replies
     ipc_calls = {}        # (pid, tls) -> (service, command) of an outstanding SendSyncRequest
     ipc_failures = collections.Counter()   # (pid, service, command, result) -> count
+    secmon_calls = {}     # (pid, tls) -> user SMC forwarded by an outstanding CallSecureMonitor
     with open(trace_path, errors='replace') as f:
         for line in f:
             m = SVC_RE.match(line)
             if m:
                 kind, _, pid, tls, sid, rest = m.groups()
                 pid, sid, key = int(pid), int(sid, 16), (int(pid), tls)
+                if sid == 0x7F:   # CallSecureMonitor carries a user SMC: same redaction policy as the smc lines
+                    regs = regs_of(rest)
+                    if kind == 'svc':
+                        secmon_calls[key] = (0, int(regs.get(0, '0x0'), 16))
+                    k = secmon_calls.get(key, (0, None)) if kind == 'svc' else secmon_calls.pop(key, (0, None))
+                    public = SMC_ARGS_PUBLIC if kind == 'svc' else SMC_RESULTS_PUBLIC
+                    open_regs = SMC_ARG_REGS_PUBLIC.get(k, set()) if kind == 'svc' else set()
+                    if k not in public and any(v != '<redacted>' for r, v in regs.items() if r and r not in open_regs):
+                        leaks.append('%s CallSecureMonitor(%s) not redacted' % (kind, SMC_NAMES.get(k, k[1])))
                 if kind == 'svc':
                     svc[(pid, sid)] += 1
                     desc = SVC_NAMES.get(sid, 'svc%#x' % sid)
@@ -222,9 +249,9 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
                 continue
             m = MMIO_RE.match(line)
             if m:
-                _, rw, addr, val = m.groups()
+                cpu, rw, addr, val = m.groups()
                 addr = int(addr, 16)
-                dev = device_of(addr)
+                dev = 'adsp' if int(cpu) == ADSP_CPU else device_of(addr)
                 mmio.setdefault(dev, collections.Counter())[rw] += 1
                 if any(a <= addr < b for a, b in SECRET_RANGES) and val != '<redacted>':
                     leaks.append('SE/PKA value not redacted at %#x' % addr)
@@ -237,25 +264,32 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED):
                     name = 'FP access'
                 exc[(name, frm, to)] += 1
 
-    procs, uart_bad = {}, []
+    procs, uart_bad, crashes = {}, [], {}
     if uart_path and os.path.exists(uart_path):
         with open(uart_path, errors='replace') as f:
             uart = f.read()
         procs = {int(p): n for p, n in PROC_RE.findall(uart)}
         uart_bad = sorted({m.group(0) for m in UART_BAD.finditer(uart)})
+        crashes = {prog: kind for kind, prog in CRASH_RE.findall(uart)}
+    if callable(expected_crashes):
+        expected_crashes = expected_crashes(list(crashes.items()))
+    expected = set(expected_crashes) & set(crashes)
 
     violations = []
     violations += ['unknown SMC imm=%d id=%#x' % k for k in smc if k not in SMC_NAMES]
     violations += ['SMC issued from EL%d' % el for el in smc_el if el != 1]
     violations += ['user SMC issued on core %d (exosphere requires core 3)' % c for c in user_smc_cores if c != 3]
     violations += ['MMIO to %s (not in allowlist)' % d for d in mmio if d not in allowed]
+    el0_fault_expected = any(crashes[p] == 'Exception occurred' for p in expected)
     violations += ['exception %s %s->%s' % e for e in exc
-                   if e not in EXC_ALLOWED and e != ('FP access', 'EL0', 'EL1')]
+                   if e not in EXC_ALLOWED and e != ('FP access', 'EL0', 'EL1')
+                   and not (el0_fault_expected and e[1:] == ('EL0', 'EL1'))]
     violations += ['UART: %s' % b for b in uart_bad]
+    violations += ['UART: %s %s' % (kind, prog) for prog, kind in sorted(crashes.items()) if prog not in expected]
     violations += sorted(set(leaks))
     return {'allowed': allowed, 'smc': smc, 'smc_ret': smc_ret, 'mmio': mmio, 'exc': exc, 'violations': violations,
             'svc': svc, 'procs': procs, 'ports': ports, 'registered': registered, 'lookups': lookups,
-            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures}
+            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures, 'crashes': crashes}
 
 
 def proc_name(r, pid):

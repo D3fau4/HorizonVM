@@ -10,6 +10,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 KEY_DATA_S = os.path.join(ROOT, 'third_party/Atmosphere/exosphere/program/source/boot/secmon_boot_key_data.s')
+SMC_AES_CPP = os.path.join(ROOT, 'third_party/Atmosphere/exosphere/program/source/smc/secmon_smc_aes.cpp')
+KEY_TYPE_DEFAULT, SEAL_KEY_IMPORT_ES_DEVICE_KEY = 0, 3        # secmon_smc_aes.cpp KeyType / SealKey
 
 # keyslot -> source. 'synthetic' keys are console-unique: generated once, they are the VM identity.
 PROFILES = {
@@ -70,6 +72,24 @@ def parse_volatile_keys(path=KEY_DATA_S):
         fields[name] = data[off:off + size]
         off += size
     return fields
+
+
+def parse_smc_table(name, path=SMC_AES_CPP):
+    """A u8[N][16] table of exosphere's secmon_smc_aes.cpp (designated initializers, in enum order)."""
+    with open(path) as f:
+        text = f.read()
+    body = re.search(r'constexpr const u8 %s\[[^\]]*\]\[AesKeySize\] = \{(.*?)\n\s*\};' % name, text, re.S).group(1)
+    return [bytes(int(b, 16) for b in re.findall(r'0x([0-9A-Fa-f]{2})', row))
+            for row in re.findall(r'=\s*\{([^}]*)\}', body)]
+
+
+def es_device_key_kek(keys):
+    """The key exosphere decrypts es' device key blob with (ImportEsDeviceKey): GenerateAesKek(eticket_rsa_kekek_source,
+    generation 1.0.0, KeyType_Default, SealKey_ImportEsDeviceKey), then eticket_rsa_kek_source (secmon_smc_aes.cpp)."""
+    static = bytes(a ^ b for a, b in zip(parse_smc_table('KeyTypeSources')[KEY_TYPE_DEFAULT],
+                                         parse_smc_table('SealKeyMasks')[SEAL_KEY_IMPORT_ES_DEVICE_KEY]))
+    kek = aes_dec(aes_dec(get_key(keys, 'master_key_00'), static), get_key(keys, 'eticket_rsa_kekek_source'))
+    return aes_dec(kek, get_key(keys, 'eticket_rsa_kek_source'))
 
 
 def device_unique_key(soc, ident, keys):

@@ -11,10 +11,14 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import hvm_keys  # noqa: E402
+import hvm_leakscan  # noqa: E402
 import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
 import hvm_nbd   # noqa: E402
+import hvm_smoke  # noqa: E402
+import mkcal0   # noqa: E402
 import mknand   # noqa: E402
+import mksd     # noqa: E402
 import mkexo0   # noqa: E402
 import mkfuses  # noqa: E402
 import mkpkg2   # noqa: E402
@@ -500,7 +504,7 @@ def guest_edit(disk, name, work, edit):
         old, new = before[unit:unit + hvm_nand.XTS_SECTOR], after[unit:unit + hvm_nand.XTS_SECTOR]
         if old == new:
             continue
-        cipher = hvm_nand.xts(key, new, unit // hvm_nand.XTS_SECTOR, True)
+        cipher = new if key is None else hvm_nand.xts(key, new, unit // hvm_nand.XTS_SECTOR, True)
         for sec in range(0, len(new), hvm_nand.LBA):
             if old[sec:sec + hvm_nand.LBA] != new[sec:sec + hvm_nand.LBA]:
                 disk.write(start + unit + sec, cipher[sec:sec + hvm_nand.LBA])
@@ -598,6 +602,197 @@ class TestNbdWriteBack(unittest.TestCase):
         self.assertEqual(again.overlay.sectors(), [8, 9])
 
 
+@unittest.skipUnless(TOOLS_AVAILABLE, 'dosfstools/mtools/gdisk not available')
+class TestSd(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = hvm_nand.HVM
+        hvm_nand.HVM = self.d
+        make_nand_fixture(self.d)                       # identity (disk id)
+        paths = hvm_nand.sd_paths('erista')
+        os.makedirs(paths['sd'])
+        with open(paths['config'], 'w') as f:
+            f.write('{"size": %d}' % (4 << 30))
+        self.tree = paths['dir']
+        rel = ['atmosphere/package3', 'atmosphere/stratosphere.romfs',
+               'atmosphere/config_templates/system_settings.ini', 'atmosphere/contents/0100000000000008/exefs.nsp']
+        for i, r in enumerate(rel):
+            os.makedirs(os.path.join(self.tree, os.path.dirname(r)), exist_ok=True)
+            with open(os.path.join(self.tree, r), 'wb') as f:
+                f.write(hashlib.sha512(r.encode()).digest() * (0x100 * (i + 1)))
+        self.img = paths['image']
+
+    def tearDown(self):
+        hvm_nand.HVM = self.old
+        shutil.rmtree(self.d)
+
+    def test_image_and_synthesized_disk_agree(self):
+        mksd.build_image('erista', self.tree, self.img)
+        self.assertEqual(mksd.verify('erista', self.tree, self.img), [])
+        disk = hvm_nbd.open_disk('erista', self.tree, self.d, False, 'sd')
+        self.assertEqual(disk.size, 4 << 30)
+        mbr = disk.read(0, hvm_nand.LBA)
+        self.assertEqual(mbr[450], 0x0C)
+        self.assertEqual(struct.unpack_from('<II', mbr, 454), (hvm_nand.SD_PART_OFFSET // hvm_nand.LBA,
+                                                               ((4 << 30) - hvm_nand.SD_PART_OFFSET) // hvm_nand.LBA))
+        vol = os.path.join(self.d, 'sd.fat')
+        hvm_nbd.export_partition('erista', self.tree, 'SD', vol)
+        r = subprocess.run(['fsck.fat', '-n', vol], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout[-500:])
+        with open(self.img, 'rb') as f:
+            self.assertEqual(f.read(hvm_nand.LBA), mbr)
+            f.seek(hvm_nand.SD_PART_OFFSET)
+            self.assertEqual(f.read(0x5A), disk.read(hvm_nand.SD_PART_OFFSET, 0x5A))   # same mkfs.fat geometry
+
+    def test_write_back(self):
+        with open(hvm_nand.sd_paths('erista')['config'], 'w') as f:
+            f.write('{"size": %d}' % (64 << 20))       # small card: guest_edit works on a full plaintext copy
+        opts = hvm_nand.FAT_OPTS['SD']
+        hvm_nand.FAT_OPTS['SD'] = ['-F', '32', '-s', '1']
+        self.addCleanup(hvm_nand.FAT_OPTS.__setitem__, 'SD', opts)
+        disk = hvm_nbd.open_disk('erista', self.tree, self.d, True, 'sd')
+        new = os.path.join(self.d, 'backup.bin')
+        with open(new, 'wb') as f:
+            f.write(b'b' * 70000)
+        img = guest_edit(disk, 'SD', self.d, lambda i: mtools(
+            i, ('mmd', '::/atmosphere/automatic_backups'),
+            ('mcopy', new, '::/atmosphere/automatic_backups/BLANK_PRODINFO.bin'),
+            ('mdel', '::/atmosphere/package3')))
+        stats = hvm_nbd.reconcile(disk)
+        self.assertEqual(stats['files written'], 1)
+        want = mknand.tree_files(TestNbdWriteBack.expected_safe(self, img))
+        self.assertEqual(set(mknand.tree_files(self.tree)), set(want))
+        self.assertFalse(os.path.exists(os.path.join(self.tree, 'atmosphere/package3')))
+        disk.overlay.clear()
+
+
+class TestMkcal0(unittest.TestCase):
+    ECID = {'vendor': 1, 'fab': 2, 'lot0': 0x12345678, 'lot1': 3, 'wafer': 4, 'x': 5, 'y': 6, 'reserved': 0}
+    REF = os.path.join(hvm_nand.HVM, 'ref', 'prodinfo-ref.bin')
+
+    def fake_ref(self):
+        """A reference whose every block holds random data with a valid CRC."""
+        ref = bytearray(hashlib.sha512(b'ref').digest() * (hvm_nand.CAL0_SIZE // 64))
+        ref[:4] = b'CAL0'
+        for name, (off, size) in mkcal0.BLOCKS.items():
+            if name not in mkcal0.NO_CRC:
+                struct.pack_into('<H', ref, off + size - 2, hvm_nand.crc16(ref[off:off + size - 2]))
+        return bytes(ref)
+
+    def test_structure(self):
+        for soc in ('erista', 'mariko'):
+            for ref in (None, self.fake_ref()):
+                cal = mkcal0.build_cal0(soc, self.ECID, ref)
+                self.assertTrue(hvm_nand.check_cal0(cal))
+                self.assertEqual(mkcal0.check_blocks(cal), [])
+                for name in mkcal0.ABSENT | (mkcal0.OPTIONAL if ref is None else mkcal0.OPTIONAL - mkcal0.IMPORTED):
+                    self.assertFalse(mkcal0.crc_ok(cal, name), name)       # absent for HOS
+                serial = cal[0x250:0x250 + 14].decode()
+                self.assertEqual(serial[:4], mkcal0.PROFILES[soc]['serial_prefix'])
+                self.assertEqual(mkcal0.check_digit(serial[3:13]), serial[13])
+        self.assertEqual(mkcal0.check_digit('1007527345'), '2')             # switchbrew example
+
+    def test_only_whitelisted_reference_bytes_matter(self):
+        ref = bytearray(self.fake_ref())
+        imported = [mkcal0.BLOCKS[n] for n in mkcal0.IMPORTED]
+        other = bytearray(b ^ 0xFF for b in ref)
+        for off, size in imported:
+            other[off:off + size] = ref[off:off + size]
+        other[:4] = b'CAL0'
+        self.assertEqual(mkcal0.build_cal0('erista', self.ECID, bytes(ref)),
+                         mkcal0.build_cal0('erista', self.ECID, bytes(other)))
+
+    def test_device_id(self):
+        # CompressLotCode: base-36 digits of the 6-bit fields of lot0 (fuse_api.cpp)
+        clot0 = 0
+        for i in range(4, -1, -1):
+            clot0 = clot0 * 36 + ((self.ECID['lot0'] >> (i * 6)) & 0x3F)
+        self.assertEqual(mkcal0.device_id(self.ECID), 6 | 5 << 9 | 4 << 18 | (clot0 & ((1 << 26) - 1)) << 24 | 2 << 50)
+
+    @staticmethod
+    def ams_gmac(key, iv, aad):
+        """Port of libvapours crypto_gcm_mode_impl.arch.arm64.cpp (Reset with a 16-byte iv, UpdateAad, GetMac)."""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        enc = lambda b: Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(b)
+
+        def mult(x, y):                           # GaloisFieldMult on byte strings
+            xv, yv, out = int.from_bytes(x, 'big'), int.from_bytes(y, 'big'), 0
+            for _ in range(128):
+                if yv >> 127:
+                    out ^= xv
+                yv = (yv << 1) & ((1 << 128) - 1)
+                xv = (xv >> 1) ^ (0xE1 << 120 if xv & 1 else 0)
+            return out.to_bytes(16, 'big')
+
+        h = enc(bytes(16))
+
+        def ghash(data, msg_size, aad_size):
+            x = bytes(16)
+            for i in range(0, len(data), 16):
+                x = mult(bytes(a ^ b for a, b in zip(x, data[i:i + 16])), h)
+            last = (((msg_size | aad_size << 64) << 3) & ((1 << 128) - 1)).to_bytes(16, 'big')
+            return mult(bytes(a ^ b for a, b in zip(x, last)), h)
+
+        ek0 = ghash(iv, 16, 0)
+        return bytes(a ^ b for a, b in zip(ghash(aad, 0, len(aad)), enc(ek0)))
+
+    def test_device_unique_blob(self):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        key, iv = hashlib.sha256(b'k').digest()[:16], hashlib.sha256(b'iv').digest()[:16]
+        data = hashlib.sha512(b'd').digest() * 8 + bytes(16)                   # 0x210, like the RSA key
+        blob = mkcal0.encrypt_device_unique(key, iv, data, 0x6312345678ABCDEF)
+        self.assertEqual(len(blob), 0x240)                                     # ImportEsDeviceKey data size
+        enc, mac = blob[16:-16], blob[-16:]
+        plain = Cipher(algorithms.AES(key), modes.CTR(iv)).decryptor().update(enc)
+        self.assertEqual(self.ams_gmac(key, iv, plain), mac)                   # exosphere's GMAC check
+        self.assertEqual(plain[:len(data)], data)
+        self.assertEqual(struct.unpack('>Q', plain[-8:])[0] & ((1 << 56) - 1), 0x12345678ABCDEF)
+
+    @unittest.skipUnless(os.path.exists(os.path.join(hvm_nand.HVM, 'ref', 'prodinfo-ref.bin')), 'no reference PRODINFO')
+    def test_real_reference_identity_not_copied(self):
+        ref = read(self.REF)
+        cal = mkcal0.build_cal0('erista', self.ECID, ref)
+        for name in ('SerialNumber', 'WlanMacAddress', 'BdAddress', 'BatteryLot', 'RandomNumber',
+                     'EccB233DeviceCertificate', 'Rsa2048ETicketCertificate', 'GameCardCertificate',
+                     'AmiiboEcdsaCertificate', 'AmiiboEcqvBlsRootCertificate'):
+            off, size = mkcal0.BLOCKS[name]
+            if any(ref[off:off + size - 2]):
+                self.assertNotEqual(cal[off:off + size - 2], ref[off:off + size - 2], name)
+
+
+class TestLeakScan(unittest.TestCase):
+    def test_scan(self):
+        d = tempfile.mkdtemp()
+        try:
+            hvm, repo = os.path.join(d, 'hvm'), os.path.join(d, 'repo')
+            for sub in ('identity/erista', 'logs', 'sd/erista/dir', 'nand/erista'):
+                os.makedirs(os.path.join(hvm, sub))
+            os.makedirs(repo)
+            subprocess.run(['git', 'init', '-q', repo], check=True)
+            with open(os.path.join(repo, '.gitignore'), 'w') as f:
+                f.write('*.keys\n')
+            bis = bytes(range(0x40, 0xC0))
+            files = {'identity/erista/bis.bin': bis, 'sd/erista/dir/X_BISKEYS.bin': bis,
+                     'nand/erista/emmc.img': bis, 'logs/clean.log': b'x0=0x1234\n'}
+            for rel, data in files.items():
+                with open(os.path.join(hvm, rel), 'wb') as f:
+                    f.write(data)
+            self.assertEqual(hvm_leakscan.scan(hvm, repo), [])
+            leaks = {'logs/hex.log': b'key=' + bis[16:32].hex().upper().encode() + b'\n',
+                     'logs/reg.log': b'x2=0x%x\n' % int.from_bytes(bis[40:48], 'little'),
+                     'logs/raw.bin': b'\x00' + bis[64:80],
+                     'logs/copy_BISKEYS.bin': b''}
+            for rel, data in leaks.items():
+                with open(os.path.join(hvm, rel), 'wb') as f:
+                    f.write(data)
+            with open(os.path.join(repo, 'prod.keys'), 'w') as f:
+                f.write('')
+            found = {os.path.relpath(p, d) for p, _ in hvm_leakscan.scan(hvm, repo)}
+            self.assertEqual(found, {'hvm/' + k for k in leaks} | {'repo/prod.keys'})
+        finally:
+            shutil.rmtree(d)
+
+
 def tipc(cmd, name=b'', pid=False):
     """A tipc request as it sits in TLS (sm_msg dump)."""
     words = [16 + cmd, (1 << 31) if pid else 0]
@@ -683,6 +878,11 @@ class TestHvmLog(unittest.TestCase):
             'smc_ret cpu=0 el=1 pc=0x0 imm=1 id=0xc3000005 x0=0x0 x1=0x5\n': 'not redacted',
             'smc cpu=3 el=1 pc=0x0 imm=0 id=0xc3000007 x1=0x1234 x2=<redacted>\n': 'GenerateAesKek not redacted',
             'smc_ret cpu=3 el=1 pc=0x0 imm=0 id=0xc3000006 x0=0x0 x1=0xabcd\n': 'GenerateRandomBytes not redacted',
+            'svc cpu=3 pid=6 tls=0x1 pc=0x0 id=0x7f x0=0xc300100d x1=0x1234 x2=<redacted> x3=<redacted>\n':
+                'CallSecureMonitor(DecryptDeviceUniqueData) not redacted',
+            'svc cpu=3 pid=6 tls=0x1 pc=0x0 id=0x7f x0=0xc3000006 x1=<redacted> x2=<redacted> x3=<redacted>\n'
+            'svc_ret cpu=3 pid=6 tls=0x1 pc=0x4 id=0x7f x0=0x0 x1=0xabcd x2=<redacted> x3=<redacted>\n':
+                'svc_ret CallSecureMonitor(GenerateRandomBytes) not redacted',
             'smc cpu=1 el=1 pc=0x0 imm=0 id=0xc3000002 x1=0x3\n': 'core 1',
         }
         for line, expect in cases.items():
@@ -695,6 +895,42 @@ class TestHvmLog(unittest.TestCase):
         for uart in ('Exception occurred. 0100000000000028\n', 'Core[3]: Kernel Panic at x.cpp:1\n',
                      "Abort: 'R_SUCCEEDED(rc)' in Main, process=0x02, thread=5 (main)\n"):
             self.assertTrue(self.analyze(self.GOOD, uart=uart)['violations'], uart)
+
+    def test_adsp_mmio_by_cpu(self):
+        adsp = 'mmio cpu=5 pc=0x80521b48 W addr=0xc02770 size=4 val=0x1\nmmio cpu=5 pc=0x0 R addr=0x702ec040 size=4 val=0x0\n'
+        self.assertIn('MMIO to adsp (not in allowlist)', self.analyze(self.GOOD + adsp)['violations'])
+        self.assertEqual(self.analyze(self.GOOD + adsp)['mmio']['adsp']['R'], 1)
+
+    def test_expected_crash(self):
+        uart = self.UART + 'erpt: svc::Break(0) was called, pid=3\nBreak() called. 010000000000002b\n'
+        self.assertIn('UART: Break() called 010000000000002b', self.analyze(self.GOOD, uart=uart)['violations'])
+        d = tempfile.mkdtemp()
+        try:
+            paths = [os.path.join(d, n) for n in 'tqu']
+            for path, text in zip(paths, (self.GOOD, self.QEMU, uart)):
+                with open(path, 'w') as f:
+                    f.write(text)
+            r = hvm_log.analyze(*paths, expected_crashes={'010000000000002b'})
+            self.assertEqual((r['violations'], r['crashes']), ([], {'010000000000002b': 'Break() called'}))
+        finally:
+            shutil.rmtree(d)
+
+    def test_account_frontier_and_fatal_cascade(self):
+        account, pcv, fs = hvm_smoke.ACCOUNT, '010000000000001a', '0100000000000000'
+        cascade = ''.join('Break() called. %s\n' % p for p in (account, pcv, fs))
+        d = tempfile.mkdtemp()
+        try:
+            paths = [os.path.join(d, n) for n in 'tqu']
+            for uart, ini, ok in ((cascade, 'stock', True), (cascade, 'ams', False),
+                                  ('Break() called. %s\n' % account, 'ams', True),
+                                  ('Break() called. %s\nBreak() called. %s\n' % (pcv, account), 'stock', False)):
+                for path, text in zip(paths, (self.GOOD, self.QEMU, self.UART + uart)):
+                    with open(path, 'w') as f:
+                        f.write(text)
+                r = hvm_log.analyze(*paths, expected_crashes=hvm_smoke.expected_crashes(ini))
+                self.assertEqual(r['violations'] == [], ok, (ini, uart, r['violations']))
+        finally:
+            shutil.rmtree(d)
 
 
 if __name__ == '__main__':

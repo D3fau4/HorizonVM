@@ -31,11 +31,46 @@ PARTITIONS = [
     ('USER',                   0xA7800000, 0x680000000, '2B777F63-E842-47AF-94C4-25A7F18B2280', 3, 'fat32'),
 ]
 PART = {p[0]: p for p in PARTITIONS}
+FAT_OPTS = {'PRODINFOF': ['-F', '12'], 'SAFE': ['-F', '32', '-s', '1'],     # mkfs.fat options per volume
+            'SYSTEM': ['-F', '32', '-s', '32'], 'USER': ['-F', '32', '-s', '32'],  # 16 KiB clusters
+            'SD': ['-F', '32', '-s', '64']}                                        # 32 KiB clusters
+
+# SD card (SDMMC1): MBR + one FAT32 LBA partition (type 0x0C), no BIS encryption.
+SD_PART_OFFSET = 0x400000
+SD_DEFAULT_SIZE = 8 << 30
 
 
 def soc_paths(soc):
     return {'identity': os.path.join(HVM, 'identity', soc), 'nand': os.path.join(HVM, 'nand', soc),
             'dir': os.path.join(HVM, 'nand', soc, 'dir'), 'image': os.path.join(HVM, 'nand', soc, 'emmc.img')}
+
+
+def sd_paths(soc):
+    """Per SoC: ams_mitm writes that identity's PRODINFO and BIS key backups to the card."""
+    root = os.path.join(HVM, 'sd', soc)
+    return {'sd': root, 'dir': os.path.join(root, 'dir'), 'image': os.path.join(root, 'sd.img'),
+            'config': os.path.join(root, 'sd.json')}
+
+
+def sd_size(soc):
+    try:
+        with open(sd_paths(soc)['config']) as f:
+            return json.load(f)['size']
+    except FileNotFoundError:
+        return SD_DEFAULT_SIZE
+
+
+def build_mbr(disk_size, disk_id):
+    mbr = bytearray(LBA)
+    struct.pack_into('<I', mbr, 440, disk_id)
+    struct.pack_into('<B3sB3sII', mbr, 446, 0, b'\xfe\xff\xff', 0x0C, b'\xfe\xff\xff',
+                     SD_PART_OFFSET // LBA, (disk_size - SD_PART_OFFSET) // LBA)
+    mbr[510:512] = b'\x55\xaa'
+    return bytes(mbr)
+
+
+def sd_disk_id(soc):
+    return disk_guids(soc)[0].int & 0xFFFFFFFF
 
 
 def load_bis_keys(soc):
