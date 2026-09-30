@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 HorizonVM is a headless ARM64 VM for Horizon OS (Nintendo Switch): tegra_qemu (Tegra X1 / X1+) runs Atmosphère's
 real exosphere at EL3, which hands off to Mesosphere and the INI1 processes. There is no fusee/BPMP: the host
 tools generate everything fusee would normally leave behind. Current status and pending milestones live in
-`docs/fase3.md`. The user communicates in Spanish.
+`docs/fase4.md` (earlier phases: `docs/fase3.md`). The user communicates in Spanish.
 
 ## Commands
 
@@ -25,7 +25,8 @@ scripts/run.sh --soc mariko --ini stock --trace && tools/hvm_log.py --soc mariko
 VM data setup per SoC (`mkfuses`, `hvm_keys --derive-bis`, `mknand`, `mkcal0`, `mksd`) is in `README.md`.
 Atmosphère supports firmware ≤ 22.5.0 only.
 ams/stock run with `-icount` (guest clock follows instructions, single-threaded TCG; `run.sh --realtime` disables
-it): an ams/stock smoke cell takes ~5–7 min, `--long` ~12. Run one VM at a time.
+it): an ams/stock smoke cell takes ~6–8 min, `--long` ~13. Run one VM at a time. ams/stock also get a USB Ethernet
+adapter (`--eth none` removes it) on an isolated network: `tools/hvm_net.py` never opens an INET socket.
 
 ## Architecture
 
@@ -36,6 +37,10 @@ it): an ams/stock smoke cell takes ~5–7 min, `--long` ~12. Run one VM at a tim
 - `hvm_keys.py`: SE keyslot secrets and BIS keys.
 - `patches/tegra_qemu/0003`: bootloader register state that pcv needs (CAR SPARE_REG0, PMIC VDD_CPU/LDO2), set per
   SoC through `-global` properties.
+- `patches/tegra_qemu/0004`–`0008`: hardware for the USB-C port and the network: GPIO input/output lines with
+  interrupts, the BM92T36 USB-PD controller (OTG plug), the XUSB host (Falcon/mailbox HLE, SMMU DMA), the ASIX
+  AX88772 USB NIC, and SD/eMMC completion latency (drivers sleep on the IRQ; without it account lost a race with
+  nifm on the saturated core 3).
 
 **SoC profiles.**
 - `erista` (tegrax1, Icosa) and `mariko` (tegrax1plus, Iowa) must both keep working.
@@ -64,7 +69,7 @@ it): an ams/stock smoke cell takes ~5–7 min, `--long` ~12. Run one VM at a tim
 - `hvm_log.py` turns that log, plus the UART and `-d int` logs, into summaries: per-device MMIO allowlists, crashes,
   and leak detection.
 - `hvm_smoke.py` boots headless and checks per-profile expectations (READY regex, idle cores, `ams_checks` /
-  `stock_checks`, `EXPECTED_CRASHES`). Extend it with every milestone.
+  `stock_checks`, `usb_checks`, no crashes). Extend it with every milestone.
 - `gdb/horizonvm.gdb` needs `gdb-multiarch` (devkitA64's gdb has no Python).
 
 ## Rules

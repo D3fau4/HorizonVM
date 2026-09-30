@@ -37,6 +37,9 @@ scripts/run.sh --nand dir --persist  # ... and write the guest's changes back in
 scripts/run.sh --sd dir              # SD card from ~/.horizonvm/sd/<soc>/dir (default: follows --nand for ams/stock)
 scripts/run.sh --maintenance         # volume buttons held: boot2 launches its maintenance list
 scripts/run.sh --realtime            # ams/stock run with -icount (guest clock = instructions) unless this
+scripts/run.sh --eth none            # no USB Ethernet (ams/stock default: an ASIX AX88772 on the USB-C port by OTG,
+                                     # on an isolated network served by tools/hvm_net.py: DHCP, DNS -> NXDOMAIN)
+HVM_NET_PCAP=/tmp/net.pcap scripts/run.sh   # ... also capture the adapter's traffic (event log: logs/net-<soc>.log)
 tools/hvm_nbd.py sync --soc erista --to /tmp/snap   # snapshot folders + pending writes (safe while running)
 tools/hvm_nbd.py sync --disk sd --soc erista          # the same for the SD card
 scripts/run.sh --soc erista --gdb    # then: gdb-multiarch -x gdb/horizonvm.gdb -ex hvm-trace

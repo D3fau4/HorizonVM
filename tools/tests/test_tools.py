@@ -916,23 +916,21 @@ class TestHvmLog(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
-    def test_account_frontier_and_fatal_cascade(self):
-        account, pcv, fs = hvm_smoke.ACCOUNT, '010000000000001a', '0100000000000000'
-        cascade = ''.join('Break() called. %s\n' % p for p in (account, pcv, fs))
+    def test_expected_crashes_callable(self):
+        # expected_crashes may be a function of the crashes in UART order (e.g. a known first crasher)
+        first, other = '010000000000001e', '010000000000001a'
         d = tempfile.mkdtemp()
         try:
             paths = [os.path.join(d, n) for n in 'tqu']
-            for uart, ini, ok in ((cascade, 'stock', True), (cascade, 'ams', False),
-                                  ('Break() called. %s\n' % account, 'ams', True),
-                                  ('Break() called. %s\nBreak() called. %s\n' % (pcv, account), 'stock', False)):
+            for uart, ok in (('Break() called. %s\nBreak() called. %s\n' % (first, other), True),
+                             ('Break() called. %s\nBreak() called. %s\n' % (other, first), False)):
                 for path, text in zip(paths, (self.GOOD, self.QEMU, self.UART + uart)):
                     with open(path, 'w') as f:
                         f.write(text)
-                r = hvm_log.analyze(*paths, expected_crashes=hvm_smoke.expected_crashes(ini))
-                self.assertEqual(r['violations'] == [], ok, (ini, uart, r['violations']))
+                r = hvm_log.analyze(*paths, expected_crashes=lambda c: {p for p, _ in c} if c[0][0] == first else set())
+                self.assertEqual(r['violations'] == [], ok, (uart, r['violations']))
         finally:
             shutil.rmtree(d)
-
 
     def test_device_events_split_exception_records(self):
         # trace events print from the main loop thread and can land inside a multi-line -d int record

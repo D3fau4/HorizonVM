@@ -1,0 +1,236 @@
+SDHCI: optional completion latency in virtual time (cmd-latency-ns, data-ns-per-kib), set for the Tegra eMMC and SD: drivers sleep on the interrupt instead of monopolizing the core.
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index 76bae21..c41e37c 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -282,12 +282,15 @@ static void sdhci_set_readonly(DeviceState *dev, bool level)
+     }
+ }
+ 
++static void sdhci_latency_clear(SDHCIState *s);
++
+ static void sdhci_reset(SDHCIState *s)
+ {
+     DeviceState *dev = DEVICE(s);
+ 
+     timer_del(s->insert_timer);
+     timer_del(s->transfer_timer);
++    sdhci_latency_clear(s);
+ 
+     /*
+      * Set all registers to 0. Capabilities/Version registers are not cleared
+@@ -325,6 +328,68 @@ static void sdhci_data_transfer(void *opaque);
+ 
+ #define BLOCK_SIZE_MASK (4 * KiB - 1)
+ 
++static bool sdhci_has_latency(SDHCIState *s)
++{
++    return s->cmd_latency_ns || s->data_ns_per_kib;
++}
++
++static void sdhci_latency_arm(SDHCIState *s)
++{
++    int64_t next = INT64_MAX;
++
++    if (s->pending_cmd_nis) {
++        next = s->cmd_deadline;
++    }
++    if (s->pending_xfer_nis || s->pending_prnsts_clear) {
++        next = MIN(next, s->xfer_deadline);
++    }
++    if (next == INT64_MAX) {
++        timer_del(s->latency_timer);
++    } else {
++        timer_mod(s->latency_timer, next);
++    }
++}
++
++static void sdhci_latency_expired(void *opaque)
++{
++    SDHCIState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (s->pending_cmd_nis && now >= s->cmd_deadline) {
++        s->norintsts |= s->pending_cmd_nis;
++        s->pending_cmd_nis = 0;
++        s->prnsts &= ~SDHC_CMD_INHIBIT;
++    }
++    if ((s->pending_xfer_nis || s->pending_prnsts_clear) && now >= s->xfer_deadline) {
++        s->norintsts |= s->pending_xfer_nis;
++        s->prnsts &= ~s->pending_prnsts_clear;
++        s->pending_xfer_nis = 0;
++        s->pending_prnsts_clear = 0;
++    }
++    sdhci_update_irq(s);
++    sdhci_latency_arm(s);
++}
++
++static void sdhci_latency_clear(SDHCIState *s)
++{
++    s->pending_cmd_nis = s->pending_xfer_nis = 0;
++    s->pending_prnsts_clear = 0;
++    timer_del(s->latency_timer);
++}
++
++/* Raise a normal interrupt status bit now, or when the command (cmd) / its data transfer completes. */
++static void sdhci_raise_nis(SDHCIState *s, uint16_t bits, bool cmd)
++{
++    if (!sdhci_has_latency(s)) {
++        s->norintsts |= bits;
++    } else if (cmd) {
++        s->pending_cmd_nis |= bits;
++    } else {
++        s->pending_xfer_nis |= bits;
++    }
++    sdhci_latency_arm(s);
++}
++
+ static void sdhci_send_command(SDHCIState *s)
+ {
+     SDRequest request;
+@@ -337,6 +402,18 @@ static void sdhci_send_command(SDHCIState *s)
+     request.cmd = s->cmdreg >> 8;
+     request.arg = s->argument;
+ 
++    if (sdhci_has_latency(s)) {
++        uint64_t bytes = 0;
++
++        if (s->cmdreg & SDHC_CMD_DATA_PRESENT) {
++            bytes = (uint64_t)(s->blksize & BLOCK_SIZE_MASK) *
++                    ((s->trnmod & SDHC_TRNS_MULTI) && s->blkcnt ? s->blkcnt : 1);
++        }
++        s->cmd_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->cmd_latency_ns;
++        s->xfer_deadline = s->cmd_deadline + bytes * s->data_ns_per_kib / KiB;
++        s->prnsts |= SDHC_CMD_INHIBIT;
++    }
++
+     trace_sdhci_send_command(request.cmd, request.arg);
+     rlen = sdbus_do_command(&s->sdbus, &request, response);
+ 
+@@ -365,12 +442,15 @@ static void sdhci_send_command(SDHCIState *s)
+         if (!(s->quirks & SDHCI_QUIRK_NO_BUSY_IRQ) &&
+             (s->norintstsen & SDHC_NISEN_TRSCMP) &&
+             (s->cmdreg & SDHC_CMD_RESPONSE) == SDHC_CMD_RSP_WITH_BUSY) {
+-            s->norintsts |= SDHC_NIS_TRSCMP;
++            sdhci_raise_nis(s, SDHC_NIS_TRSCMP, false);
+         }
+     }
+ 
+     if (s->norintstsen & SDHC_NISEN_CMDCMP) {
+-        s->norintsts |= SDHC_NIS_CMDCMP;
++        sdhci_raise_nis(s, SDHC_NIS_CMDCMP, true);
++    } else if (sdhci_has_latency(s)) {
++        s->pending_prnsts_clear |= SDHC_CMD_INHIBIT;
++        sdhci_latency_arm(s);
+     }
+ 
+     sdhci_update_irq(s);
+@@ -397,13 +477,19 @@ static void sdhci_end_transfer(SDHCIState *s)
+         s->rspreg[3] = ldl_be_p(response);
+     }
+ 
+-    s->prnsts &= ~(SDHC_DOING_READ | SDHC_DOING_WRITE |
+-            SDHC_DAT_LINE_ACTIVE | SDHC_DATA_INHIBIT |
+-            SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE);
++    if (sdhci_has_latency(s)) {
++        s->prnsts &= ~(SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE);
++        s->pending_prnsts_clear |= SDHC_DOING_READ | SDHC_DOING_WRITE | SDHC_DAT_LINE_ACTIVE | SDHC_DATA_INHIBIT;
++    } else {
++        s->prnsts &= ~(SDHC_DOING_READ | SDHC_DOING_WRITE |
++                SDHC_DAT_LINE_ACTIVE | SDHC_DATA_INHIBIT |
++                SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE);
++    }
+ 
+     if (s->norintstsen & SDHC_NISEN_TRSCMP) {
+-        s->norintsts |= SDHC_NIS_TRSCMP;
++        sdhci_raise_nis(s, SDHC_NIS_TRSCMP, false);
+     }
++    sdhci_latency_arm(s);
+ 
+     sdhci_update_irq(s);
+ }
+@@ -1138,6 +1224,9 @@ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+     case SDHC_RESET_CMD:
+         s->prnsts &= ~SDHC_CMD_INHIBIT;
+         s->norintsts &= ~SDHC_NIS_CMDCMP;
++        s->pending_cmd_nis = 0;
++        s->pending_prnsts_clear &= ~SDHC_CMD_INHIBIT;
++        sdhci_latency_arm(s);
+         break;
+     case SDHC_RESET_DATA:
+         s->data_count = 0;
+@@ -1148,6 +1237,9 @@ static inline void sdhci_reset_write(SDHCIState *s, uint8_t value)
+         s->stopped_state = sdhc_not_stopped;
+         s->norintsts &= ~(SDHC_NIS_WBUFRDY | SDHC_NIS_RBUFRDY |
+                 SDHC_NIS_DMA | SDHC_NIS_TRSCMP | SDHC_NIS_BLKGAP);
++        s->pending_xfer_nis = 0;
++        s->pending_prnsts_clear &= SDHC_CMD_INHIBIT;
++        sdhci_latency_arm(s);
+         break;
+     }
+ }
+@@ -1419,6 +1511,7 @@ void sdhci_initfn(SDHCIState *s)
+                                    sdhci_raise_insertion_irq, s);
+     s->transfer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      sdhci_data_transfer, s);
++    s->latency_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sdhci_latency_expired, s);
+ 
+     s->io_ops = &sdhci_mmio_le_ops;
+ }
+@@ -1427,6 +1520,7 @@ void sdhci_uninitfn(SDHCIState *s)
+ {
+     timer_free(s->insert_timer);
+     timer_free(s->transfer_timer);
++    timer_free(s->latency_timer);
+ 
+     g_free(s->fifo_buffer);
+     s->fifo_buffer = NULL;
+@@ -1555,6 +1649,8 @@ static Property sdhci_sysbus_properties[] = {
+                      dma_mr, TYPE_MEMORY_REGION, MemoryRegion *),
+     DEFINE_PROP_UINT32("dma_dev", SDHCIState,
+                      dma_dev, 0),
++    DEFINE_PROP_UINT32("cmd-latency-ns", SDHCIState, cmd_latency_ns, 0),
++    DEFINE_PROP_UINT32("data-ns-per-kib", SDHCIState, data_ns_per_kib, 0),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/include/hw/sd/sdhci.h b/include/hw/sd/sdhci.h
+index 8a9cced..d3c46eb 100644
+--- a/include/hw/sd/sdhci.h
++++ b/include/hw/sd/sdhci.h
+@@ -51,6 +51,15 @@ struct SDHCIState {
+     QEMUTimer *transfer_timer;
+     qemu_irq irq;
+ 
++    /* Optional completion latency (virtual time): command complete after cmd_latency_ns, transfer complete after
++     * the data at data_ns_per_kib more, with CMD/DATA inhibit held until then. 0/0 completes at once. */
++    uint32_t cmd_latency_ns;
++    uint32_t data_ns_per_kib;
++    QEMUTimer *latency_timer;
++    uint16_t pending_cmd_nis, pending_xfer_nis;
++    uint32_t pending_prnsts_clear;
++    int64_t cmd_deadline, xfer_deadline;
++
+     /* Registers cleared on reset */
+     uint32_t sdmasysad;    /* SDMA System Address register */
+     uint16_t blksize;      /* Host DMA Buff Boundary and Transfer BlkSize Reg */
+diff --git a/hw/arm/tegra2/tegrax1.c b/hw/arm/tegra2/tegrax1.c
+index bf96015..7b11918 100644
+--- a/hw/arm/tegra2/tegrax1.c
++++ b/hw/arm/tegra2/tegrax1.c
+@@ -529,6 +529,15 @@ static void* tegra_init_sdmmc(int index, hwaddr base, qemu_irq irq, bool emmc, u
+     void* tmpdev = qdev_new(TYPE_SYSBUS_SDHCI);
+     qdev_prop_set_uint32(tmpdev, "capareg", 0x376c0c8c); // Value from hardware is 0x376cd08c. Workaround qemu BASECLKFREQ validation.
+     qdev_prop_set_uint32(tmpdev, "dma_dev", TegraIommuDeviceName_Sdmmc1a + index);
++    // Command/transfer completion takes time, as on the real cards (drivers sleep on the interrupt meanwhile):
++    // eMMC ~250 MB/s (HS400), SD ~25 MB/s (high speed; no UHS at 3.3 V).
++    if (emmc) {
++        qdev_prop_set_uint32(tmpdev, "cmd-latency-ns", 50000);
++        qdev_prop_set_uint32(tmpdev, "data-ns-per-kib", 4000);
++    } else if (index == 0) {
++        qdev_prop_set_uint32(tmpdev, "cmd-latency-ns", 100000);
++        qdev_prop_set_uint32(tmpdev, "data-ns-per-kib", 40000);
++    }
+     sysbus_realize_and_unref(SYS_BUS_DEVICE(tmpdev), &error_fatal);
+ 
+     //sysbus_mmio_map(SYS_BUS_DEVICE(tmpdev), 0, base);

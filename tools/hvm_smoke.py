@@ -24,22 +24,11 @@ READY = {'ams': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot2'),
          'stock': ('uart', r'KProcess::Exit\(\) pid=\d+ name=boot2')}
 EXTRA_ALLOWED = {'ams': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2),
                  'stock': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2)}
-# Known frontier: account aborts the first time it builds idgen:/context.bin, which needs the MAC address of a network
-# interface, and nifm has none (neither the PCIe WLAN nor a USB Ethernet adapter is emulated). On stock, the fatal it
-# throws makes every sysmodule that throws one afterwards (pcv, vi, Bus, hid, FS, ...) Break: "fatal already thrown".
+# account builds idgen:/context.bin on its first boot from the MAC addresses nifm lists; it used to abort when it asked
+# before nifm's interface thread had run (phase 3 frontier, gone with the SD/eMMC completion latency).
 ACCOUNT = '010000000000001e'
 ETH_DEFAULT = {'ams': 'ax88772', 'stock': 'ax88772'}          # = run.sh
 ADAPTER_MAC = {'erista': '02:48:56:4d:00:01', 'mariko': '02:48:56:4d:00:02'}
-
-
-def expected_crashes(ini):
-    def expected(crashes):          # [(program id, kind)] in UART order
-        if not crashes or crashes[0] != (ACCOUNT, 'Break() called'):
-            return set()
-        if ini == 'stock' and all(kind == 'Break() called' for _, kind in crashes):
-            return {prog for prog, _ in crashes}
-        return {ACCOUNT}
-    return expected
 LR_PROGRAM_NOT_FOUND = 8 | (2 << 9)    # lr::ResultProgramNotFound, 2008-0002
 IDLE_SAMPLES = 5
 # Cores that must reach WFI. With boot2's sysmodules up, core 3 (their only core) stays busy: nvservices polls
@@ -69,21 +58,29 @@ def wait_for(path, pattern, proc, timeout):
     return None
 
 
-def monitor(sock_path, commands):
+def monitor(sock_path, commands, timeout=60):
+    """Run HMP commands, each answered up to the next "(qemu)" prompt (a busy main loop can take a while)."""
     s = socket.socket(socket.AF_UNIX)
     s.connect(sock_path)
-    s.settimeout(1.0)
+    s.settimeout(timeout)
     out = b''
-    for c in commands + ['']:
-        s.sendall(c.encode() + b'\n')
-        while True:
+
+    def until_prompt():
+        nonlocal out
+        buf = b''
+        while not ANSI.sub('', buf.decode('latin-1')).rstrip().endswith('(qemu)'):
             try:
                 chunk = s.recv(65536)
             except socket.timeout:
                 break
             if not chunk:
                 break
-            out += chunk
+            buf += chunk
+        out += buf
+    until_prompt()                                  # banner
+    for c in commands:
+        s.sendall(c.encode() + b'\n')
+        until_prompt()
     s.close()
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
@@ -131,7 +128,7 @@ def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False,
     trace = hvm_log.analyze(os.path.join(HVM, 'logs', 'hvmtrace-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'qemu-%s.log' % soc),
                             os.path.join(HVM, 'logs', 'uart-%s.log' % soc),
-                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})), expected_crashes(ini))
+                            dict(hvm_log.ALLOWED, **EXTRA_ALLOWED.get(ini, {})))
     for v in trace['violations']:
         print('%-7s %-5s %-5s trace: %s' % (soc, ini, nand or '', v))
     return [
@@ -246,7 +243,7 @@ def ams_checks(trace, log, maintenance=False):
          pcv_ok(trace, pcv) and 'pcie' in registered_by(trace, 'pcie')),
         ('ams_mitm mounts the SD: pm launches Atmosphère boot2 from stratosphere.romfs, and it launches memlet',
          {'boot2', 'memlet'} <= names),
-        crash_check('ams', trace),
+        crash_check(trace),
         ('volume buttons held: boot2 launches its maintenance list (no friends bcat eupld)' if maintenance else
          'volume buttons released: boot2 launches its normal list (friends bcat eupld)',
          not MAINTENANCE_SKIPPED & names if maintenance else MAINTENANCE_SKIPPED <= names),
@@ -260,24 +257,17 @@ def late_checks(trace):
         ('late: bluetooth/btm/hid serve btdrv btm xcd:sys (valid CAL0 Bluetooth address)',
          {'btdrv', 'btm', 'xcd:sys'} <= registered),
         ('late: omm serves spsm, nifm nifm:s', {'spsm', 'nifm:s'} <= registered),
-        ('late frontier: account aborts building idgen:/context.bin (nifm lists no network interface)',
-         ACCOUNT in trace['crashes']),
+        ('late: account builds idgen:/context.bin from the listed interfaces (no abort)',
+         ACCOUNT not in trace['crashes']),
     ]
 
 
-def cascade(trace):
-    """account's fatal came first: later fatal:u lookups are other sysmodules failing to throw theirs."""
-    return next(iter(trace['crashes']), None) == ACCOUNT
-
-
 def pcv_ok(trace, pcv):
-    return cascade(trace) or not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups'])
+    return not any(p in pcv and n == 'fatal:u' for p, n in trace['lookups'])
 
 
-def crash_check(ini, trace):
-    return ('crashes: none, or account without a network interface' +
-            (' and the fatal cascade it starts' if ini == 'stock' else ''),
-            set(trace['crashes']) <= expected_crashes(ini)(list(trace['crashes'].items())))
+def crash_check(trace):
+    return ('crashes: none', not trace['crashes'])
 
 
 BOOT2_MODULES = {'boot2.ProdB', 'psc', 'settings', 'usb', 'pcie', 'Bus', 'pcv'}   # KProcess names (12 chars)
@@ -306,7 +296,7 @@ def stock_checks(trace, log, ncm_db):
          BOOT2_MODULES <= names),
         ('pcv initializes (no fatal:u); boot2 goes past omm: am nvservices vi ns hid audio',
          pcv_ok(trace, pcv) and {'am', 'nvservices', 'vi', 'ns', 'hid', 'audio'} <= names),
-        crash_check('stock', trace),
+        crash_check(trace),
     ] if ncm_db else [
         ('frontier: pm cannot launch boot2, ldr:pm GetProgramInfo -> 2008-0002 (Nintendo ncm does not rebuild its DB)',
          any(p in pm and svc == 'ldr:pm' and cmd == 1 and rc == LR_PROGRAM_NOT_FOUND
