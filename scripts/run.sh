@@ -3,6 +3,7 @@
 # usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--sd image|dir|none]
 #               [--persist] [--maintenance] [--display] [--realtime] [--user-exc] [--gdb] [--trace]
 #               [-- extra qemu args]
+# HVM_OTG_DEVICE="<qemu -device spec>" (debug): plug that USB device into the USB-C port instead.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +35,12 @@ while [ $# -gt 0 ]; do
         --display) DISPLAY_ARGS=(-display none -vnc "127.0.0.1:$((${HVM_VNC:-5900} - 5900))")
                    echo "display: VNC on 127.0.0.1:${HVM_VNC:-5900}" >&2; shift ;;
         --gdb) GDB=(-s -S); shift ;;
-        --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log${HVM_TRACE_ARGS:+,$HVM_TRACE_ARGS}"); shift ;;
+        --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log${HVM_TRACE_ARGS:+,$HVM_TRACE_ARGS}"
+                        -trace 'enable=bm92t36_*'
+                        -trace 'enable=usb_xhci_run' -trace 'enable=usb_xhci_stop' -trace 'enable=usb_xhci_reset'
+                        -trace 'enable=usb_xhci_port_reset' -trace 'enable=usb_xhci_slot_*' -trace 'enable=usb_port_*'
+                        -trace 'enable=usb_desc_device' -trace 'enable=usb_desc_config' -trace 'enable=usb_set_config'
+                        -trace 'enable=usb_xhci_unimplemented'); shift ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -104,6 +110,9 @@ if [ -z "$REALTIME" ] && { [ "$INI" = ams ] || [ "$INI" = stock ]; }; then
     # real-time periodic work (hid polling the touch panel, vsync, audio) otherwise saturates the emulated core 3
     # and starves lower-priority processes. Costs MTTCG (all vCPUs on one host thread).
     EXTRA+=(-icount shift=0,sleep=off)
+fi
+if [ -n "${HVM_OTG_DEVICE:-}" ]; then
+    EXTRA+=(-global driver=bm92t36,property=state,value=otg -device "$HVM_OTG_DEVICE,bus=usb-bus.2,port=1")
 fi
 if [ "$SOC" = mariko ]; then
     # exosphere copies the Mariko fatal program from 0x80020000 into TZRAM (secmon_boot_setup.cpp LoadMarikoProgram).

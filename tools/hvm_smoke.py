@@ -141,7 +141,8 @@ def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False)
          IDLE_CORES.get(ini, {0, 1, 2, 3}) <= idle_cores),
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
-    ] + profile_checks(soc, ini, trace, log, maintenance, long) + writeback_checks(soc, ini, nand, persist)
+    ] + profile_checks(soc, ini, trace, log, maintenance, long) + writeback_checks(soc, ini, nand, persist) + \
+        usb_checks(ini, trace)
 
 
 def writeback_checks(soc, ini, nand, persist):
@@ -156,6 +157,15 @@ def writeback_checks(soc, ini, nand, persist):
              {'8000000000000000', '8000000000000120'} <= names),
             ('write-back: ams_mitm backs the CAL0 up as <serial>_PRODINFO.bin (valid for a secure backup)',
              os.path.isdir(backups) and serial + '_PRODINFO.bin' in os.listdir(backups))]
+
+
+def usb_checks(ini, trace):
+    """USB-C port: the usb sysmodule drives the PD controller (bm92t36 trace events)."""
+    if ini not in ('ams', 'stock'):
+        return []
+    resets = [a for name, a in trace['events'] if name == 'bm92t36_command' and a.endswith('0x0d0d')]
+    return [('usb: the PD controller completes one SYS_RESET (CMD_DONE through the CradleIrq alert, no retries)',
+             len(resets) == 1)]
 
 
 def user_smc_calls(trace):

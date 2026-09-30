@@ -933,5 +933,17 @@ class TestHvmLog(unittest.TestCase):
             shutil.rmtree(d)
 
 
+    def test_device_events_split_exception_records(self):
+        # trace events print from the main loop thread and can land inside a multi-line -d int record
+        qemu = ('Taking exception 1 [Undefined Instruction] on CPU 3\n'
+                'bm92t36_command command 0x0d0d\n'
+                '...from EL0 to EL1\n...with ESR 0x7/0x1fe00000\n'
+                '12345@1700000000.000001:usb_xhci_run \n')
+        r = self.analyze(self.GOOD, qemu)
+        self.assertEqual(r['violations'], [])
+        self.assertEqual(r['events'], [('bm92t36_command', 'command 0x0d0d'), ('usb_xhci_run', '')])
+        self.assertEqual(r['exc'][('FP access', 'EL0', 'EL1')], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

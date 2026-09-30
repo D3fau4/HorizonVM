@@ -1,0 +1,435 @@
+ROHM BM92T36 USB-PD controller on I2C1 0x18 (was a dummyi2c): ALERT on GPIO K4 (CradleIrq), reset from GPIO V5 (PdRstN); state none|otg (a non-PD USB device behind an OTG adapter, VBUS while CONFIG1 enables a source switch).
+diff --git a/hw/misc/bm92t36.c b/hw/misc/bm92t36.c
+new file mode 100644
+index 0000000..3a7cdea
+--- /dev/null
++++ b/hw/misc/bm92t36.c
+@@ -0,0 +1,349 @@
++/*
++ * ROHM BM92T36 USB Type-C / Power Delivery controller (I2C)
++ *
++ * Only what a host driver needs to see a plug state: 16-bit little-endian registers, block registers prefixed
++ * with a byte count, read-to-clear ALERT_STATUS behind an active-low ALERT line, and the COMMAND register
++ * completing immediately. The PD state machine itself is not emulated: "state" fixes what is plugged in.
++ *   none: nothing inserted.
++ *   otg:  a USB device without PD (the console is DFP and sources VBUS), as with a USB-C OTG adapter. VBUS
++ *         (STATUS1 VSAFE) is on while CONFIG1 enables a source switch; turning it on reports a plug event.
++ * Register layout per the ROHM register names used by Linux drivers (bm92txx).
++ *
++ * This work is licensed under the GNU GPL license version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++#include "trace.h"
++
++#define TYPE_BM92T36 "bm92t36"
++OBJECT_DECLARE_SIMPLE_TYPE(BM92T36State, BM92T36)
++
++#define REG_ALERT_STATUS    0x02
++#define REG_STATUS1         0x03
++#define REG_STATUS2         0x04
++#define REG_COMMAND         0x05
++#define REG_CONFIG1         0x06
++#define REG_ALERT_ENABLE    0x2E
++#define REG_FW_TYPE         0x4B
++#define REG_FW_REVISION     0x4C
++#define REG_MAN_ID          0x4D
++#define REG_DEV_ID          0x4E
++#define REG_REV_ID          0x4F
++
++#define ALERT_CMD_DONE      BIT(2)
++#define ALERT_PLUGPULL      BIT(3)
++
++#define STATUS1_LASTCMD_MASK (7 << 4)
++#define STATUS1_INSERT      BIT(7)
++#define STATUS1_DR_DFP      (2 << 8)
++#define STATUS1_VSAFE       BIT(10)
++#define STATUS1_SRC_MODE    BIT(12)
++#define STATUS2_OTG_INSERT  BIT(13)
++
++#define CONFIG1_SPDSRC_MASK (3 << 14)
++#define CONFIG1_SPDSRC_OFF  (3 << 14)      /* both VBUS source switches off (reset state) */
++
++#define CMD_SYS_RESET       0x0D0D
++
++#define BLOCK_MAX           28
++#define XFER_MAX            (BLOCK_MAX + 1)
++
++struct BM92T36State {
++    I2CSlave parent_obj;
++
++    char *state;
++    uint16_t dev_id, man_id, fw_type, fw_rev, rev_id;
++
++    uint16_t regs[0x100];
++    uint8_t blocks[0x100][BLOCK_MAX];   /* only used for the block registers */
++    uint16_t alert_pending;
++    bool reset_alert;                   /* ALERT asserted after a reset until ALERT_STATUS is read */
++    bool rst_level;
++
++    int16_t reg;                        /* -1 until the register byte of a write */
++    bool receiving;
++    uint8_t xfer[XFER_MAX];
++    uint8_t xfer_len, xfer_pos;
++    qemu_irq alert;
++};
++
++static int bm92t36_block_size(uint8_t reg)
++{
++    switch (reg) {
++    case 0x20: case 0x23: case 0x28: case 0x2B: case 0x30:
++        return 4;
++    case 0x33:
++        return 16;
++    case 0x08: case 0x3C: case 0x50: case 0x60:
++        return BLOCK_MAX;
++    default:
++        return 0;
++    }
++}
++
++static bool bm92t36_otg(BM92T36State *s)
++{
++    return s->state && !strcmp(s->state, "otg");
++}
++
++static void bm92t36_update_alert(BM92T36State *s)
++{
++    bool asserted = s->reset_alert || (s->alert_pending & s->regs[REG_ALERT_ENABLE]);
++
++    trace_bm92t36_alert(s->alert_pending, asserted);
++    qemu_set_irq(s->alert, !asserted);
++}
++
++static void bm92t36_reset_regs(BM92T36State *s)
++{
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->blocks, 0, sizeof(s->blocks));
++    s->regs[REG_ALERT_ENABLE] = 0xFFFF;
++    s->regs[REG_CONFIG1] = CONFIG1_SPDSRC_OFF;
++    s->regs[REG_FW_TYPE] = s->fw_type;
++    s->regs[REG_FW_REVISION] = s->fw_rev;
++    s->regs[REG_MAN_ID] = s->man_id;
++    s->regs[REG_DEV_ID] = s->dev_id;
++    s->regs[REG_REV_ID] = s->rev_id;
++    if (bm92t36_otg(s)) {
++        s->regs[REG_STATUS1] = STATUS1_INSERT | STATUS1_DR_DFP | STATUS1_SRC_MODE;
++        s->regs[REG_STATUS2] = STATUS2_OTG_INSERT;
++    }
++    s->alert_pending = 0;
++    s->reset_alert = true;
++}
++
++static void bm92t36_command(BM92T36State *s, uint16_t cmd)
++{
++    trace_bm92t36_command(cmd);
++    if (cmd == CMD_SYS_RESET) {
++        bm92t36_reset_regs(s);
++        s->reset_alert = false;
++    }
++    s->regs[REG_STATUS1] &= ~STATUS1_LASTCMD_MASK;     /* LASTCMD = complete */
++    s->alert_pending |= ALERT_CMD_DONE;
++    bm92t36_update_alert(s);
++}
++
++static void bm92t36_commit_write(BM92T36State *s)
++{
++    uint8_t reg = s->reg;
++    int size = bm92t36_block_size(reg);
++
++    if (s->xfer_len == 0) {
++        return;
++    }
++    if (size) {
++        memset(s->blocks[reg], 0, BLOCK_MAX);
++        memcpy(s->blocks[reg], &s->xfer[1], MIN(MIN(s->xfer[0], size), s->xfer_len - 1));
++        trace_bm92t36_write(reg, s->xfer[0]);
++    } else if (s->xfer_len >= 2) {
++        uint16_t value = s->xfer[0] | (s->xfer[1] << 8);
++
++        trace_bm92t36_write(reg, value);
++        switch (reg) {
++        case REG_COMMAND:
++            bm92t36_command(s, value);
++            break;
++        case REG_ALERT_STATUS:
++            s->alert_pending &= ~value;
++            bm92t36_update_alert(s);
++            break;
++        case REG_STATUS1: case REG_STATUS2:
++        case REG_FW_TYPE: case REG_FW_REVISION: case REG_MAN_ID: case REG_DEV_ID: case REG_REV_ID:
++            break;
++        case REG_CONFIG1: {
++            bool vbus = (value & CONFIG1_SPDSRC_MASK) != CONFIG1_SPDSRC_OFF;
++
++            s->regs[reg] = value;
++            if (bm92t36_otg(s) && vbus != !!(s->regs[REG_STATUS1] & STATUS1_VSAFE)) {
++                s->regs[REG_STATUS1] ^= STATUS1_VSAFE;
++                s->alert_pending |= ALERT_PLUGPULL;
++                bm92t36_update_alert(s);
++            }
++            break;
++        }
++        default:
++            s->regs[reg] = value;
++            if (reg == REG_ALERT_ENABLE) {
++                bm92t36_update_alert(s);
++            }
++            break;
++        }
++    } else {
++        qemu_log_mask(LOG_GUEST_ERROR, "bm92t36: short write to 0x%02x\n", reg);
++    }
++    s->xfer_len = 0;
++}
++
++static void bm92t36_start_read(BM92T36State *s)
++{
++    uint8_t reg = s->reg < 0 ? 0 : s->reg;
++    int size = bm92t36_block_size(reg);
++
++    s->xfer_pos = 0;
++    if (size) {
++        s->xfer[0] = size;
++        memcpy(&s->xfer[1], s->blocks[reg], size);
++        s->xfer_len = size + 1;
++        trace_bm92t36_read(reg, size);
++        return;
++    }
++    s->xfer[0] = s->regs[reg];
++    s->xfer[1] = s->regs[reg] >> 8;
++    s->xfer_len = 2;
++    trace_bm92t36_read(reg, s->regs[reg]);
++    if (reg == REG_ALERT_STATUS) {
++        s->xfer[0] = s->alert_pending;
++        s->xfer[1] = s->alert_pending >> 8;
++        s->alert_pending = 0;
++        s->reset_alert = false;
++        bm92t36_update_alert(s);
++    }
++}
++
++static int bm92t36_event(I2CSlave *i2c, enum i2c_event event)
++{
++    BM92T36State *s = BM92T36(i2c);
++
++    if (s->reg >= 0 && !s->receiving) {
++        bm92t36_commit_write(s);
++    }
++    switch (event) {
++    case I2C_START_SEND:
++        s->reg = -1;
++        s->xfer_len = 0;
++        s->receiving = false;
++        break;
++    case I2C_START_RECV:
++        s->receiving = true;
++        bm92t36_start_read(s);
++        break;
++    default:
++        break;
++    }
++    return 0;
++}
++
++static int bm92t36_send(I2CSlave *i2c, uint8_t data)
++{
++    BM92T36State *s = BM92T36(i2c);
++
++    if (s->reg < 0) {
++        s->reg = data;
++        s->xfer_len = 0;
++    } else if (s->xfer_len < XFER_MAX) {
++        s->xfer[s->xfer_len++] = data;
++    }
++    return 0;
++}
++
++static uint8_t bm92t36_recv(I2CSlave *i2c)
++{
++    BM92T36State *s = BM92T36(i2c);
++
++    return s->xfer_pos < s->xfer_len ? s->xfer[s->xfer_pos++] : 0;
++}
++
++/* PdRstN (through the board's inverter): the controller restarts when the line drops again. */
++static void bm92t36_set_rst(void *opaque, int n, int level)
++{
++    BM92T36State *s = opaque;
++
++    if (s->rst_level && !level) {
++        bm92t36_reset_regs(s);
++        bm92t36_update_alert(s);
++    }
++    s->rst_level = level;
++}
++
++static void bm92t36_reset(DeviceState *dev)
++{
++    BM92T36State *s = BM92T36(dev);
++
++    bm92t36_reset_regs(s);
++    s->reg = -1;
++    s->receiving = false;
++    s->xfer_len = s->xfer_pos = 0;
++    s->rst_level = false;
++    bm92t36_update_alert(s);
++}
++
++static void bm92t36_realize(DeviceState *dev, Error **errp)
++{
++    BM92T36State *s = BM92T36(dev);
++
++    if (s->state && strcmp(s->state, "none") && strcmp(s->state, "otg")) {
++        error_setg(errp, "bm92t36: state must be none or otg");
++    }
++}
++
++static void bm92t36_init(Object *obj)
++{
++    BM92T36State *s = BM92T36(obj);
++
++    qdev_init_gpio_out_named(DEVICE(obj), &s->alert, "alert", 1);
++    qdev_init_gpio_in_named(DEVICE(obj), bm92t36_set_rst, "rst", 1);
++}
++
++static const VMStateDescription vmstate_bm92t36 = {
++    .name = "bm92t36",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_I2C_SLAVE(parent_obj, BM92T36State),
++        VMSTATE_UINT16_ARRAY(regs, BM92T36State, 0x100),
++        VMSTATE_UINT16(alert_pending, BM92T36State),
++        VMSTATE_BOOL(reset_alert, BM92T36State),
++        VMSTATE_BOOL(rst_level, BM92T36State),
++        VMSTATE_INT16(reg, BM92T36State),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static Property bm92t36_properties[] = {
++    DEFINE_PROP_STRING("state", BM92T36State, state),
++    DEFINE_PROP_UINT16("dev-id", BM92T36State, dev_id, 0x0001),
++    DEFINE_PROP_UINT16("man-id", BM92T36State, man_id, 0),
++    DEFINE_PROP_UINT16("fw-type", BM92T36State, fw_type, 0),
++    DEFINE_PROP_UINT16("fw-rev", BM92T36State, fw_rev, 0),
++    DEFINE_PROP_UINT16("rev-id", BM92T36State, rev_id, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void bm92t36_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = bm92t36_realize;
++    dc->vmsd = &vmstate_bm92t36;
++    device_class_set_legacy_reset(dc, bm92t36_reset);
++    device_class_set_props(dc, bm92t36_properties);
++    sc->event = bm92t36_event;
++    sc->send = bm92t36_send;
++    sc->recv = bm92t36_recv;
++}
++
++static const TypeInfo bm92t36_info = {
++    .name          = TYPE_BM92T36,
++    .parent        = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(BM92T36State),
++    .instance_init = bm92t36_init,
++    .class_init    = bm92t36_class_init,
++};
++
++static void bm92t36_register_types(void)
++{
++    type_register_static(&bm92t36_info);
++}
++
++type_init(bm92t36_register_types)
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 0c958e9..a172152 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -48,6 +48,11 @@ config MAX77XPMIC
+     depends on I2C
+     default y if I2C_DEVICES
+ 
++config BM92T36
++    bool
++    depends on I2C
++    default y if I2C_DEVICES
++
+ config PL310
+     bool
+ 
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index ebcac8b..eac6abd 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -4,6 +4,7 @@ system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+ system_ss.add(when: 'CONFIG_MAX77XPMIC', if_true: files('max77xpmic.c'))
++system_ss.add(when: 'CONFIG_BM92T36', if_true: files('bm92t36.c'))
+ system_ss.add(when: 'CONFIG_PCI_TESTDEV', if_true: files('pci-testdev.c'))
+ system_ss.add(when: 'CONFIG_UNIMP', if_true: files('unimp.c'))
+ system_ss.add(when: 'CONFIG_FIXEDMEM', if_true: files('fixedmem.c'))
+diff --git a/hw/misc/trace-events b/hw/misc/trace-events
+index b9fbcb0..f5c0fcf 100644
+--- a/hw/misc/trace-events
++++ b/hw/misc/trace-events
+@@ -299,6 +299,12 @@ aspeed_peci_raise_interrupt(uint32_t ctrl, uint32_t status) "ctrl 0x%" PRIx32 "
+ # bcm2835_property.c
+ bcm2835_mbox_property(uint32_t tag, uint32_t bufsize, size_t resplen) "mbox property tag:0x%08x in_sz:%u out_sz:%zu"
+ 
++# bm92t36.c
++bm92t36_read(uint8_t reg, uint16_t value) "reg 0x%02x -> 0x%04x"
++bm92t36_write(uint8_t reg, uint16_t value) "reg 0x%02x <- 0x%04x"
++bm92t36_command(uint16_t cmd) "command 0x%04x"
++bm92t36_alert(uint16_t pending, bool asserted) "alert pending 0x%04x asserted %d"
++
+ # bcm2835_mbox.c
+ bcm2835_mbox_write(unsigned int size, uint64_t addr, uint64_t value) "mbox write sz:%u addr:0x%"PRIx64" data:0x%"PRIx64
+ bcm2835_mbox_read(unsigned int size, uint64_t addr, uint64_t value) "mbox read sz:%u addr:0x%"PRIx64" data:0x%"PRIx64
+diff --git a/hw/arm/tegra2/tegrax1.c b/hw/arm/tegra2/tegrax1.c
+index bf96015..7b11918 100644
+--- a/hw/arm/tegra2/tegrax1.c
++++ b/hw/arm/tegra2/tegrax1.c
+@@ -77,6 +77,8 @@
+ 
+ #define DIRQ(X) qdev_get_gpio_in(tegra_irq_dispatcher_dev, X)
+ #define DIRQ_INT(X) qdev_get_gpio_in(tegra_irq_dispatcher_dev, X + INT_MAIN_NR)
++/* tegra.gpio line of pin <port letter index (A=0 ... Z=25, AA=26 ...)><pin> */
++#define TEGRA_GPIO_LINE(port, pin) ((port) * 8 + (pin))
+ 
+ #define BOOTLOADER_BASE 0x40010000
+ #define BOOTMON_BASE    0xF0010000
+@@ -1292,14 +1294,12 @@ static void __tegrax1_init(MachineState *machine)
+ 
+     dummyi2c_set_regs(tegra_i2c_fuel_dev, fuel_regs, sizeof(fuel_regs), sizeof(uint16_t), sizeof(fuel_regs)/sizeof(uint16_t));
+ 
+-    /* USB-PD controller */
+-    tegra_i2c_usbpd_dev = i2c_slave_create_simple(tegra_i2c_get_bus(tegra_idc1_dev), "dummyi2c", 0x18);
+-
+-    uint16_t usbpd_regs[0x100]={};
+-
+-    usbpd_regs[0x4E] = 0x0001;
+-
+-    dummyi2c_set_regs(tegra_i2c_usbpd_dev, usbpd_regs, sizeof(usbpd_regs), sizeof(uint16_t), sizeof(usbpd_regs)/sizeof(uint16_t));
++    /* USB-PD controller: ALERT on GPIO K4 (CradleIrq), reset from GPIO V5 (PdRstN). */
++    tegra_i2c_usbpd_dev = i2c_slave_create_simple(tegra_i2c_get_bus(tegra_idc1_dev), "bm92t36", 0x18);
++    qdev_connect_gpio_out_named(DEVICE(tegra_i2c_usbpd_dev), "alert", 0,
++                                qdev_get_gpio_in(DEVICE(tegra_gpios_dev), TEGRA_GPIO_LINE(10, 4)));
++    qdev_connect_gpio_out(DEVICE(tegra_gpios_dev), TEGRA_GPIO_LINE(21, 5),
++                          qdev_get_gpio_in_named(DEVICE(tegra_i2c_usbpd_dev), "rst", 0));
+ 
+     /* Host1x IO */
+     tegra_grhost_dev = sysbus_create_varargs("tegra.grhost",

@@ -98,6 +98,9 @@ CRASH_RE = re.compile(r'(Exception occurred|Break\(\) called)\. ([0-9a-f]{16})')
 SMC_RE = re.compile(r'^(smc|smc_ret) cpu=(\d+) el=(\d+) pc=0x([0-9a-f]+) imm=(\d+) id=0x([0-9a-f]+)(.*)$')
 SVC_RE = re.compile(r'^(svc|svc_ret) cpu=(\d+) pid=(\d+) tls=0x([0-9a-f]+) pc=0x[0-9a-f]+ id=0x([0-9a-f]+)(.*)$')
 MMIO_RE = re.compile(r'^mmio cpu=(\d+) pc=0x[0-9a-f]+ ([RW]) addr=0x([0-9a-f]+) size=\d+ val=(\S+)$')
+# QEMU trace events of our device models (log backend, optionally "pid@time:" prefixed). They are printed from other
+# threads than the -d int records and can split them, so they are taken out before matching exceptions.
+EVENT_RE = re.compile(r'^(?:\d+@[\d.]+:)?((?:bm92t36|usb_xhci|usb_port|usb_desc|usb_set|usb_asix|tegra_xusb)\w*) ?(.*)$')
 EXC_RE = re.compile(r'Taking exception \d+ \[([^\]]+)\] on CPU \d+\n\.\.\.from (EL\d) to (EL\d)\n'
                     r'(?:\.\.\.with ESR 0x([0-9a-f]+)/)?')
 REGS_RE = re.compile(r' x(\d)=(\S+)')
@@ -256,13 +259,20 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, exp
                 if any(a <= addr < b for a, b in SECRET_RANGES) and val != '<redacted>':
                     leaks.append('SE/PKA value not redacted at %#x' % addr)
 
-    exc = collections.Counter()
+    exc, events = collections.Counter(), []
     if qemu_log_path and os.path.exists(qemu_log_path):
+        rest = []
         with open(qemu_log_path, errors='replace') as f:
-            for name, frm, to, ec in EXC_RE.findall(f.read()):
-                if name == 'Undefined Instruction' and ec and int(ec, 16) == EC_FP_ACCESS:
-                    name = 'FP access'
-                exc[(name, frm, to)] += 1
+            for line in f:
+                m = EVENT_RE.match(line)
+                if m:
+                    events.append(m.groups())
+                else:
+                    rest.append(line)
+        for name, frm, to, ec in EXC_RE.findall(''.join(rest)):
+            if name == 'Undefined Instruction' and ec and int(ec, 16) == EC_FP_ACCESS:
+                name = 'FP access'
+            exc[(name, frm, to)] += 1
 
     procs, uart_bad, crashes = {}, [], {}
     if uart_path and os.path.exists(uart_path):
@@ -289,7 +299,8 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, exp
     violations += sorted(set(leaks))
     return {'allowed': allowed, 'smc': smc, 'smc_ret': smc_ret, 'mmio': mmio, 'exc': exc, 'violations': violations,
             'svc': svc, 'procs': procs, 'ports': ports, 'registered': registered, 'lookups': lookups,
-            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures, 'crashes': crashes}
+            'pending': pending, 'user_smc': user_smc, 'ipc_failures': ipc_failures, 'crashes': crashes,
+            'events': events}
 
 
 def proc_name(r, pid):
@@ -306,6 +317,10 @@ def report(r):
     print('== Exceptions')
     for (name, frm, to), n in sorted(r['exc'].items()):
         print('  %-22s %s->%s %d' % (name, frm, to, n))
+    if r['events']:
+        print('== Device events')
+        for name, n in sorted(collections.Counter(name for name, _ in r['events']).items()):
+            print('  %-26s %d' % (name, n))
     pids = sorted({p for p, _ in r['svc']} | set(r['procs']))
     if pids:
         print('== Processes')

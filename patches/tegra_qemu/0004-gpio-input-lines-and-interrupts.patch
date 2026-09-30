@@ -1,0 +1,159 @@
+GPIO: qdev input lines (port*8+pin) that board devices drive, with level/edge interrupts raised on the bank IRQ, and output lines for pins in output mode; pins nobody drives keep their reset value and never interrupt.
+diff --git a/hw/arm/tegra2/ppsb/gpio/gpio.c b/hw/arm/tegra2/ppsb/gpio/gpio.c
+index 4d6746e..c24605f 100644
+--- a/hw/arm/tegra2/ppsb/gpio/gpio.c
++++ b/hw/arm/tegra2/ppsb/gpio/gpio.c
+@@ -38,6 +38,8 @@
+ #define BANKS_NB_TEGRAX1 8
+ #define BANKS_NB         BANKS_NB_TEGRAX1
+ #define PORTS_NB    4
++#define PINS_NB     8
++#define LINES_NB    (BANKS_NB * PORTS_NB * PINS_NB)
+ 
+ typedef struct tegra_gpio_port_state {
+     DEFINE_REG32(gpio_cnf);
+@@ -93,11 +95,18 @@ typedef struct tegra_gpio_state {
+     uint32_t reset_values[BANKS_NB][PORTS_NB];
+     tegra_gpio_port regs[BANKS_NB * PORTS_NB];
+     qemu_irq irq[BANKS_NB];
++
++    /* Board devices drive pins through input line port*8+pin and see output pins on output line port*8+pin.
++     * Interrupts are only generated for driven pins; the others keep their static reset value. */
++    uint8_t line_driven[BANKS_NB * PORTS_NB];
++    uint8_t line_level[BANKS_NB * PORTS_NB];
++    uint8_t out_level[BANKS_NB * PORTS_NB];
++    qemu_irq out[LINES_NB];
+ } tegra_gpio;
+ 
+ static const VMStateDescription vmstate_tegra_gpio = {
+     .name = "tegra.gpio",
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+     .fields = (VMStateField[]) {
+         VMSTATE_UINT32(num_banks, tegra_gpio),
+@@ -107,6 +116,9 @@ static const VMStateDescription vmstate_tegra_gpio = {
+         VMSTATE_UINT32_2DARRAY(reset_values, tegra_gpio, BANKS_NB, PORTS_NB),
+         VMSTATE_STRUCT_ARRAY(regs, tegra_gpio, BANKS_NB * PORTS_NB, 0,
+                              vmstate_tegra_gpio_port, tegra_gpio_port),
++        VMSTATE_UINT8_ARRAY_V(line_driven, tegra_gpio, BANKS_NB * PORTS_NB, 2),
++        VMSTATE_UINT8_ARRAY_V(line_level, tegra_gpio, BANKS_NB * PORTS_NB, 2),
++        VMSTATE_UINT8_ARRAY_V(out_level, tegra_gpio, BANKS_NB * PORTS_NB, 2),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+@@ -157,6 +169,84 @@ static void tegra_gpio_set_reset_value(Object *obj, Visitor *v, const char *name
+     s->reset_values[bank][port] = value;
+ }
+ 
++static void tegra_gpio_update_in(tegra_gpio *s, int port_nb)
++{
++    uint8_t driven = s->line_driven[port_nb];
++
++    s->regs[port_nb].gpio_in.reg32 = (s->reset_values[port_nb / PORTS_NB][port_nb % PORTS_NB] & ~driven) |
++                                     (s->line_level[port_nb] & driven);
++}
++
++/* Level-triggered driven pins: INT_STA follows the level (INT_LVL bit x: active high, bit 8+x: edge), so clearing
++ * it only sticks once the source deasserts. */
++static void tegra_gpio_latch_levels(tegra_gpio *s, int port_nb)
++{
++    tegra_gpio_port *p = &s->regs[port_nb];
++    uint32_t lvl = p->gpio_int_lvl.reg32;
++
++    for (int pin = 0; pin < PINS_NB; pin++) {
++        if (!(s->line_driven[port_nb] & BIT(pin)) || (lvl & BIT(8 + pin))) {
++            continue;
++        }
++        if (((s->line_level[port_nb] >> pin) & 1) == ((lvl >> pin) & 1)) {
++            p->gpio_int_sta.reg32 |= BIT(pin);
++        } else {
++            p->gpio_int_sta.reg32 &= ~BIT(pin);
++        }
++    }
++}
++
++static void tegra_gpio_update_irq(tegra_gpio *s, int bank)
++{
++    int level = 0;
++
++    for (int port = 0; port < PORTS_NB; port++) {
++        int port_nb = bank * PORTS_NB + port;
++        tegra_gpio_port *p = &s->regs[port_nb];
++
++        if (p->gpio_int_sta.reg32 & p->gpio_int_enb.reg32 & p->gpio_cnf.reg32 & s->line_driven[port_nb]) {
++            level = 1;
++        }
++    }
++    qemu_set_irq(s->irq[bank], level);
++}
++
++static void tegra_gpio_update_out(tegra_gpio *s, int port_nb)
++{
++    tegra_gpio_port *p = &s->regs[port_nb];
++    uint8_t level = p->gpio_out.reg32 & p->gpio_oe.reg32 & p->gpio_cnf.reg32;
++    uint8_t changed = level ^ s->out_level[port_nb];
++
++    s->out_level[port_nb] = level;
++    for (int pin = 0; pin < PINS_NB; pin++) {
++        if (changed & BIT(pin)) {
++            qemu_set_irq(s->out[port_nb * PINS_NB + pin], (level >> pin) & 1);
++        }
++    }
++}
++
++static void tegra_gpio_set_line(void *opaque, int n, int level)
++{
++    tegra_gpio *s = opaque;
++    int port_nb = n / PINS_NB, pin = n % PINS_NB;
++    tegra_gpio_port *p = &s->regs[port_nb];
++    uint32_t lvl = p->gpio_int_lvl.reg32;
++    bool driven = s->line_driven[port_nb] & BIT(pin);
++    bool old = (s->line_level[port_nb] >> pin) & 1;
++
++    level = !!level;
++    s->line_driven[port_nb] |= BIT(pin);
++    s->line_level[port_nb] = (s->line_level[port_nb] & ~BIT(pin)) | (level << pin);
++    tegra_gpio_update_in(s, port_nb);
++
++    if (driven && old != level && (lvl & BIT(8 + pin)) &&
++        ((lvl & BIT(16 + pin)) || level == ((lvl >> pin) & 1))) {
++        p->gpio_int_sta.reg32 |= BIT(pin);
++    }
++    tegra_gpio_latch_levels(s, port_nb);
++    tegra_gpio_update_irq(s, port_nb / PORTS_NB);
++}
++
+ static uint64_t tegra_gpio_priv_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+ {
+@@ -333,6 +423,10 @@ static void tegra_gpio_priv_write(void *opaque, hwaddr offset,
+         TRACE_WRITE(s->iomem.addr, offset, 0, value);
+         break;
+     }
++
++    tegra_gpio_latch_levels(s, bank * PORTS_NB + port);
++    tegra_gpio_update_irq(s, bank);
++    tegra_gpio_update_out(s, bank * PORTS_NB + port);
+ }
+ 
+ static void tegra_gpio_priv_reset(DeviceState *dev)
+@@ -366,6 +460,8 @@ static void tegra_gpio_priv_reset(DeviceState *dev)
+             tegra_gpio_port *p = &s->regs[bank * PORTS_NB + port];
+ 
+             p->gpio_in.reg32 = s->reset_values[bank][port];
++            tegra_gpio_update_in(s, bank * PORTS_NB + port);
++            s->out_level[bank * PORTS_NB + port] = 0;
+         }
+     }
+ }
+@@ -400,6 +496,9 @@ static void tegra_gpio_priv_realize(DeviceState *dev, Error **errp)
+ 
+     for (i = 0; i < s->num_banks; i++)
+         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
++
++    qdev_init_gpio_in(dev, tegra_gpio_set_line, LINES_NB);
++    qdev_init_gpio_out(dev, s->out, LINES_NB);
+ }
+ 
+ static void tegra_gpio_class_init(ObjectClass *klass, void *data)
