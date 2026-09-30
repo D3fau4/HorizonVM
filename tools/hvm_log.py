@@ -28,6 +28,7 @@ DEVICES = [
     (0x70420000, 0x10000, 'pka1'), (0x01000000, 0x4000, 'pcie'), (0x58000000, 0x1000000, 'gpu_bar1'),
     (0x60021000, 0x1000, 'apb_dma_ch'), (0x7009F000, 0x1000, 'xusb_padctl'), (0x700E2000, 0x1000, 'soc_therm'),
     (0x70110000, 0x400, 'cl_dvfs'), (0x702C0000, 0x40000, 'ape'), (0x70030000, 0x10000, 'hda'),
+    (0x70090000, 0xA000, 'xusb_host'), (0x700D0000, 0xA000, 'xusb_dev'),
 ]
 # The APE's Cortex-A9 (tegrax1.c: "APE is cpu5") runs the ADSP firmware audio loads, in its own address space
 # (ARAM, A9 private region and L2 at 0xC00000, an APE mirror): its accesses are classified by CPU, not address.
@@ -52,7 +53,8 @@ ALLOWED_BOOT_HW = {'i2c': 'boot: PMIC/charger/fuel gauge', 'gpio': 'boot: GPIO c
 ALLOWED_BOOT2 = {'cl_dvfs': 'pcv: CPU DFLL', 'soc_therm': 'pcv/ptm: thermal', 'pcie': 'pcie', 'xusb_padctl': 'usb',
                  'gpu': 'nvservices', 'gpu_bar1': 'nvservices', 'spi': 'hid: touch screen',
                  'apb_dma': 'Bus: UART/I2C/SPI DMA', 'apb_dma_ch': 'Bus: UART/I2C/SPI DMA',
-                 'ape': 'audio: AHUB/ADMA', 'hda': 'audio: HDA', 'adsp': 'audio: ADSP firmware (cpu 5)'}
+                 'ape': 'audio: AHUB/ADMA', 'hda': 'audio: HDA', 'adsp': 'audio: ADSP firmware (cpu 5)',
+                 'xusb_host': 'usb: XUSB host (xHCI, FPCI/IPFS)'}
 
 # exosphere dispatches on the smc immediate (secmon_smc_handler.cpp): 1 = kernel table, 0 = user table.
 SMC_NAMES = {
