@@ -1,0 +1,624 @@
+usb-ax88772: ASIX AX88772 USB 2.0 Ethernet adapter (vendor command set, embedded PHY, interrupt link status, 4-byte framed bulk transfers).
+diff --git a/hw/usb/dev-asix.c b/hw/usb/dev-asix.c
+new file mode 100644
+index 0000000..71e8e39
+--- /dev/null
++++ b/hw/usb/dev-asix.c
+@@ -0,0 +1,571 @@
++/*
++ * ASIX AX88772 USB 2.0 to 10/100 Ethernet adapter
++ *
++ * The vendor control requests of the ASIX command set (as used by the Linux asix driver), the embedded PHY at
++ * MII address 0x10 (autonegotiation completes at once, link follows the netdev link), the interrupt endpoint's
++ * 8-byte status (link in byte 2 bit 0) and the bulk framing: every frame is prefixed with a 32-bit little-endian
++ * header "length | ~length << 16". Received frames are handed out one per bulk IN transfer; on transmit, frames
++ * are 2-byte aligned and a 0xffff0000 word may pad a transfer.
++ *
++ * This work is licensed under the GNU GPL license version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/qdev-properties.h"
++#include "hw/usb.h"
++#include "migration/vmstate.h"
++#include "desc.h"
++#include "net/net.h"
++#include "qemu/iov.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++#include "trace.h"
++
++#define TYPE_USB_AX88772 "usb-ax88772"
++OBJECT_DECLARE_SIMPLE_TYPE(USBAsixState, USB_AX88772)
++
++#define AX_CMD_SET_SW_MII           0x06
++#define AX_CMD_READ_MII_REG         0x07
++#define AX_CMD_WRITE_MII_REG        0x08
++#define AX_CMD_STATMNGSTS_REG       0x09
++#define AX_CMD_SET_HW_MII           0x0a
++#define AX_CMD_READ_EEPROM          0x0b
++#define AX_CMD_WRITE_EEPROM         0x0c
++#define AX_CMD_WRITE_ENABLE         0x0d
++#define AX_CMD_WRITE_DISABLE        0x0e
++#define AX_CMD_READ_RX_CTL          0x0f
++#define AX_CMD_WRITE_RX_CTL         0x10
++#define AX_CMD_READ_IPG012          0x11
++#define AX_CMD_WRITE_IPG0           0x12
++#define AX_CMD_READ_NODE_ID         0x13        /* IN; OUT 0x13 is WRITE_IPG1 */
++#define AX_CMD_WRITE_NODE_ID        0x14        /* OUT; also WRITE_IPG2 on older parts */
++#define AX_CMD_WRITE_MULTI_FILTER   0x16
++#define AX_CMD_READ_PHY_ID          0x19
++#define AX_CMD_READ_MEDIUM_STATUS   0x1a
++#define AX_CMD_WRITE_MEDIUM_MODE    0x1b
++#define AX_CMD_READ_MONITOR_MODE    0x1c
++#define AX_CMD_WRITE_MONITOR_MODE   0x1d
++#define AX_CMD_READ_GPIOS           0x1e
++#define AX_CMD_WRITE_GPIOS          0x1f
++#define AX_CMD_SW_RESET             0x20
++#define AX_CMD_SW_PHY_STATUS        0x21
++#define AX_CMD_SW_PHY_SELECT        0x22
++
++#define AX_RX_CTL_SO                0x0080      /* start operation */
++#define AX_STATMNGSTS_HOST_EN       0x01        /* software owns the MII interface */
++
++#define AX_PHY_ADDR                 0x10
++#define AX_RX_QUEUE                 32
++#define AX_FRAME_MAX                2048
++#define AX_TX_BUF                   (64 * 1024)
++
++#define MII_BMCR                    0
++#define MII_BMSR                    1
++#define MII_PHYID1                  2
++#define MII_PHYID2                  3
++#define MII_ANAR                    4
++#define MII_ANLPAR                  5
++#define MII_ANER                    6
++#define BMCR_RESET                  0x8000
++#define BMCR_ANRESTART              0x0200
++#define BMSR_BASE                   0x7809      /* 100FD/100HD/10FD/10HD, AN able, extended caps */
++#define BMSR_LINK_AN_DONE           0x0024
++
++enum {
++    STR_MANUFACTURER = 1,
++    STR_PRODUCT,
++    STR_SERIALNUMBER,
++};
++
++static const USBDescStrings desc_strings = {
++    [STR_MANUFACTURER] = "ASIX Elec. Corp.",
++    [STR_PRODUCT]      = "AX88772 ",
++    [STR_SERIALNUMBER] = "000001",
++};
++
++#define ASIX_IFACE(bulk_mps, int_interval) {                                    \
++    .bInterfaceNumber   = 0,                                                    \
++    .bNumEndpoints      = 3,                                                    \
++    .bInterfaceClass    = USB_CLASS_VENDOR_SPEC,                                \
++    .bInterfaceSubClass = 0xff,                                                 \
++    .bInterfaceProtocol = 0x00,                                                 \
++    .eps = (USBDescEndpoint[]) {                                                \
++        {                                                                       \
++            .bEndpointAddress = USB_DIR_IN | 0x01,                              \
++            .bmAttributes     = USB_ENDPOINT_XFER_INT,                          \
++            .wMaxPacketSize   = 8,                                              \
++            .bInterval        = int_interval,                                   \
++        }, {                                                                    \
++            .bEndpointAddress = USB_DIR_IN | 0x02,                              \
++            .bmAttributes     = USB_ENDPOINT_XFER_BULK,                         \
++            .wMaxPacketSize   = bulk_mps,                                       \
++        }, {                                                                    \
++            .bEndpointAddress = USB_DIR_OUT | 0x03,                             \
++            .bmAttributes     = USB_ENDPOINT_XFER_BULK,                         \
++            .wMaxPacketSize   = bulk_mps,                                       \
++        },                                                                      \
++    },                                                                          \
++}
++
++static const USBDescIface desc_iface_full = ASIX_IFACE(64, 11);
++static const USBDescIface desc_iface_high = ASIX_IFACE(512, 11);
++
++#define ASIX_DEVICE(iface) {                                                    \
++    .bcdUSB             = 0x0200,                                               \
++    .bDeviceClass       = USB_CLASS_VENDOR_SPEC,                                \
++    .bDeviceSubClass    = 0xff,                                                 \
++    .bDeviceProtocol    = 0x00,                                                 \
++    .bMaxPacketSize0    = 64,                                                   \
++    .bNumConfigurations = 1,                                                    \
++    .confs = (USBDescConfig[]) {                                                \
++        {                                                                       \
++            .bNumInterfaces      = 1,                                           \
++            .bConfigurationValue = 1,                                           \
++            .bmAttributes        = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,        \
++            .bMaxPower           = 125,                                         \
++            .nif = 1,                                                           \
++            .ifs = &iface,                                                      \
++        },                                                                      \
++    },                                                                          \
++}
++
++static const USBDescDevice desc_device_full = ASIX_DEVICE(desc_iface_full);
++static const USBDescDevice desc_device_high = ASIX_DEVICE(desc_iface_high);
++
++static const USBDesc desc_ax88772 = {
++    .id = {
++        .idVendor      = 0x0b95,
++        .idProduct     = 0x7720,
++        .bcdDevice     = 0x0001,
++        .iManufacturer = STR_MANUFACTURER,
++        .iProduct      = STR_PRODUCT,
++        .iSerialNumber = STR_SERIALNUMBER,
++    },
++    .full = &desc_device_full,
++    .high = &desc_device_high,
++    .str  = desc_strings,
++};
++
++typedef struct AsixFrame {
++    uint16_t len;
++    uint8_t data[AX_FRAME_MAX];
++} AsixFrame;
++
++struct USBAsixState {
++    USBDevice dev;
++    NICConf conf;
++    NICState *nic;
++    USBEndpoint *intr, *bulk_in;
++
++    uint8_t mac[6];
++    uint8_t multicast[8];
++    uint16_t rx_ctl, medium, gpios, monitor, sw_reset, phy_select;
++    uint8_t ipg[3];
++    bool sw_mii;
++    uint16_t phy[32];
++    bool int_pending;
++
++    AsixFrame rx[AX_RX_QUEUE];
++    unsigned rx_head, rx_count;
++    uint8_t tx[AX_TX_BUF];
++    size_t tx_len;
++};
++
++static bool asix_link_up(USBAsixState *s)
++{
++    return s->nic && !qemu_get_queue(s->nic)->link_down;
++}
++
++static void asix_phy_reset(USBAsixState *s)
++{
++    memset(s->phy, 0, sizeof(s->phy));
++    s->phy[MII_BMCR] = 0x3100;                  /* autonegotiation, 100 Mb/s, full duplex */
++    s->phy[MII_PHYID1] = 0x003b;
++    s->phy[MII_PHYID2] = 0x1881;
++    s->phy[MII_ANAR] = 0x05e1;
++    s->phy[MII_ANER] = 0x0001;
++}
++
++static uint16_t asix_phy_read(USBAsixState *s, unsigned phy, unsigned reg)
++{
++    if (phy != AX_PHY_ADDR || reg >= ARRAY_SIZE(s->phy)) {
++        return 0xffff;
++    }
++    switch (reg) {
++    case MII_BMSR:
++        return BMSR_BASE | (asix_link_up(s) ? BMSR_LINK_AN_DONE : 0);
++    case MII_ANLPAR:
++        return asix_link_up(s) ? 0x45e1 : 0;    /* partner: ack, pause, 100FD/HD, 10FD/HD */
++    default:
++        return s->phy[reg];
++    }
++}
++
++static void asix_phy_write(USBAsixState *s, unsigned phy, unsigned reg, uint16_t value)
++{
++    if (phy != AX_PHY_ADDR || reg >= ARRAY_SIZE(s->phy)) {
++        return;
++    }
++    switch (reg) {
++    case MII_BMCR:
++        if (value & BMCR_RESET) {
++            asix_phy_reset(s);
++            return;
++        }
++        s->phy[reg] = value & ~BMCR_ANRESTART;
++        break;
++    case MII_BMSR: case MII_PHYID1: case MII_PHYID2: case MII_ANLPAR: case MII_ANER:
++        break;
++    default:
++        s->phy[reg] = value;
++        break;
++    }
++}
++
++static void asix_link_event(USBAsixState *s)
++{
++    s->int_pending = true;
++    usb_wakeup(s->intr, 0);
++}
++
++static void asix_handle_reset(USBDevice *dev)
++{
++    USBAsixState *s = USB_AX88772(dev);
++
++    memcpy(s->mac, s->conf.macaddr.a, sizeof(s->mac));
++    memset(s->multicast, 0, sizeof(s->multicast));
++    s->rx_ctl = 0;
++    s->medium = 0;
++    s->gpios = 0;
++    s->monitor = 0;
++    s->sw_reset = 0;
++    s->phy_select = 0;
++    memset(s->ipg, 0, sizeof(s->ipg));
++    s->sw_mii = false;
++    asix_phy_reset(s);
++    s->rx_head = s->rx_count = 0;
++    s->tx_len = 0;
++    s->int_pending = true;
++}
++
++static void asix_handle_control(USBDevice *dev, USBPacket *p, int request, int value, int index, int length,
++                                uint8_t *data)
++{
++    USBAsixState *s = USB_AX88772(dev);
++    int len = 0;
++
++    if (usb_desc_handle_control(dev, p, request, value, index, length, data) >= 0) {
++        return;
++    }
++    trace_usb_asix_control(request, value, index, length);
++
++    switch (request) {
++    case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:   /* ENDPOINT_HALT: hosts clear it when opening pipes */
++    case EndpointOutRequest | USB_REQ_SET_FEATURE:
++        break;
++    case EndpointRequest | USB_REQ_GET_STATUS:
++        stw_le_p(data, 0);
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_STATMNGSTS_REG:
++        data[0] = s->sw_mii ? AX_STATMNGSTS_HOST_EN : 0;
++        len = 1;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_MII_REG:
++        stw_le_p(data, asix_phy_read(s, value, index));
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_EEPROM:
++        stw_le_p(data, 0);
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_RX_CTL:
++        stw_le_p(data, s->rx_ctl);
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_IPG012:
++        memcpy(data, s->ipg, 3);
++        len = 3;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_NODE_ID:
++        memcpy(data, s->mac, 6);
++        len = 6;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_PHY_ID:
++        data[0] = 0xe0;                          /* no secondary PHY */
++        data[1] = AX_PHY_ADDR;                   /* primary: the embedded PHY */
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_MEDIUM_STATUS:
++        stw_le_p(data, s->medium);
++        len = 2;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_MONITOR_MODE:
++        data[0] = s->monitor;
++        len = 1;
++        break;
++    case VendorDeviceRequest | AX_CMD_READ_GPIOS:
++        data[0] = s->gpios;
++        len = 1;
++        break;
++    case VendorDeviceRequest | AX_CMD_SW_PHY_STATUS:
++        data[0] = s->phy_select;
++        len = 1;
++        break;
++
++    case VendorDeviceOutRequest | AX_CMD_SET_SW_MII:
++        s->sw_mii = true;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_SET_HW_MII:
++        s->sw_mii = false;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_MII_REG:
++        if (length >= 2) {
++            asix_phy_write(s, value, index, lduw_le_p(data));
++        }
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_EEPROM:
++    case VendorDeviceOutRequest | AX_CMD_WRITE_ENABLE:
++    case VendorDeviceOutRequest | AX_CMD_WRITE_DISABLE:
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_RX_CTL: {
++        bool started = !(s->rx_ctl & AX_RX_CTL_SO) && (value & AX_RX_CTL_SO);
++
++        s->rx_ctl = value;
++        if (started) {
++            asix_link_event(s);
++            qemu_flush_queued_packets(qemu_get_queue(s->nic));
++        }
++        break;
++    }
++    case VendorDeviceOutRequest | AX_CMD_WRITE_IPG0:
++        s->ipg[0] = value;
++        break;
++    case VendorDeviceOutRequest | 0x13:            /* WRITE_IPG1 */
++        s->ipg[1] = value;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_NODE_ID:
++        if (length >= 6) {
++            memcpy(s->mac, data, 6);
++            qemu_format_nic_info_str(qemu_get_queue(s->nic), s->mac);
++        } else {
++            s->ipg[2] = value;
++        }
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_MULTI_FILTER:
++        memcpy(s->multicast, data, MIN(length, 8));
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_MEDIUM_MODE:
++        s->medium = value;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_MONITOR_MODE:
++        s->monitor = value;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_WRITE_GPIOS:
++        s->gpios = value;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_SW_RESET:
++        s->sw_reset = value;
++        break;
++    case VendorDeviceOutRequest | AX_CMD_SW_PHY_SELECT:
++        s->phy_select = value;
++        break;
++    default:
++        trace_usb_asix_unsupported(request, value, index, length);
++        p->status = USB_RET_STALL;
++        return;
++    }
++    p->actual_length = len;
++}
++
++static void asix_handle_datain(USBAsixState *s, USBPacket *p)
++{
++    AsixFrame *f;
++    uint8_t hdr[4];
++
++    if (!s->rx_count) {
++        p->status = USB_RET_NAK;
++        return;
++    }
++    f = &s->rx[s->rx_head];
++    if (p->iov.size < f->len + 4) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    stw_le_p(hdr, f->len);
++    stw_le_p(hdr + 2, ~f->len);
++    usb_packet_copy(p, hdr, 4);
++    usb_packet_copy(p, f->data, f->len);
++    trace_usb_asix_rx(f->len);
++    s->rx_head = (s->rx_head + 1) % AX_RX_QUEUE;
++    s->rx_count--;
++    qemu_flush_queued_packets(qemu_get_queue(s->nic));
++}
++
++static void asix_handle_dataout(USBAsixState *s, USBPacket *p)
++{
++    size_t size = MIN(p->iov.size, sizeof(s->tx) - s->tx_len), pos = 0;
++
++    usb_packet_copy(p, s->tx + s->tx_len, size);
++    s->tx_len += size;
++    while (s->tx_len - pos >= 4) {
++        uint32_t hdr = ldl_le_p(s->tx + pos);
++        uint16_t len = hdr & 0xffff;
++
++        if (hdr == 0xffff0000) {                   /* padding word */
++            pos += 4;
++            continue;
++        }
++        if ((hdr >> 16) != (uint16_t)~len || len == 0 || len > AX_FRAME_MAX) {
++            trace_usb_asix_tx_bad(hdr);
++            pos = s->tx_len;
++            break;
++        }
++        if (s->tx_len - pos < 4 + len) {
++            break;                                 /* rest of the frame in the next packet */
++        }
++        trace_usb_asix_tx(len);
++        qemu_send_packet(qemu_get_queue(s->nic), s->tx + pos + 4, len);
++        pos += 4 + ((len + 1) & ~1);
++    }
++    pos = MIN(pos, s->tx_len);
++    memmove(s->tx, s->tx + pos, s->tx_len - pos);
++    s->tx_len -= pos;
++}
++
++static void asix_handle_statusin(USBAsixState *s, USBPacket *p)
++{
++    uint8_t buf[8] = { 0xa1, 0x00, asix_link_up(s) ? 0x01 : 0x00 };
++
++    if (!s->int_pending) {
++        p->status = USB_RET_NAK;
++        return;
++    }
++    s->int_pending = false;
++    usb_packet_copy(p, buf, MIN(p->iov.size, sizeof(buf)));
++}
++
++static void asix_handle_data(USBDevice *dev, USBPacket *p)
++{
++    USBAsixState *s = USB_AX88772(dev);
++
++    if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
++        asix_handle_statusin(s, p);
++    } else if (p->pid == USB_TOKEN_IN && p->ep->nr == 2) {
++        asix_handle_datain(s, p);
++    } else if (p->pid == USB_TOKEN_OUT && p->ep->nr == 3) {
++        asix_handle_dataout(s, p);
++    } else {
++        p->status = USB_RET_STALL;
++    }
++}
++
++static bool asix_can_receive(NetClientState *nc)
++{
++    USBAsixState *s = qemu_get_nic_opaque(nc);
++
++    return s->rx_count < AX_RX_QUEUE;
++}
++
++static ssize_t asix_receive(NetClientState *nc, const uint8_t *buf, size_t size)
++{
++    USBAsixState *s = qemu_get_nic_opaque(nc);
++    AsixFrame *f;
++
++    if (!s->dev.config || !(s->rx_ctl & AX_RX_CTL_SO) || size > AX_FRAME_MAX) {
++        return size;                               /* not receiving: drop */
++    }
++    if (s->rx_count == AX_RX_QUEUE) {
++        return 0;
++    }
++    f = &s->rx[(s->rx_head + s->rx_count) % AX_RX_QUEUE];
++    memcpy(f->data, buf, size);
++    f->len = size;
++    s->rx_count++;
++    usb_wakeup(s->bulk_in, 0);
++    return size;
++}
++
++static void asix_set_link_status(NetClientState *nc)
++{
++    asix_link_event(qemu_get_nic_opaque(nc));
++}
++
++static void asix_cleanup(NetClientState *nc)
++{
++    USBAsixState *s = qemu_get_nic_opaque(nc);
++
++    s->nic = NULL;
++}
++
++static NetClientInfo net_asix_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = asix_can_receive,
++    .receive = asix_receive,
++    .link_status_changed = asix_set_link_status,
++    .cleanup = asix_cleanup,
++};
++
++static void asix_realize(USBDevice *dev, Error **errp)
++{
++    USBAsixState *s = USB_AX88772(dev);
++
++    usb_desc_init(dev);
++    s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
++    s->bulk_in = usb_ep_get(dev, USB_TOKEN_IN, 2);
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    s->nic = qemu_new_nic(&net_asix_info, &s->conf, object_get_typename(OBJECT(s)), s->dev.qdev.id,
++                          &s->dev.qdev.mem_reentrancy_guard, s);
++    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
++    asix_handle_reset(dev);
++}
++
++static void asix_unrealize(USBDevice *dev)
++{
++    USBAsixState *s = USB_AX88772(dev);
++
++    qemu_del_nic(s->nic);
++}
++
++static const VMStateDescription vmstate_usb_asix = {
++    .name = "usb-ax88772",
++    .unmigratable = 1,
++};
++
++static Property asix_properties[] = {
++    DEFINE_NIC_PROPERTIES(USBAsixState, conf),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void asix_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize        = asix_realize;
++    uc->unrealize      = asix_unrealize;
++    uc->product_desc   = "ASIX AX88772";
++    uc->usb_desc       = &desc_ax88772;
++    uc->handle_reset   = asix_handle_reset;
++    uc->handle_control = asix_handle_control;
++    uc->handle_data    = asix_handle_data;
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++    dc->vmsd = &vmstate_usb_asix;
++    device_class_set_props(dc, asix_properties);
++}
++
++static const TypeInfo asix_info = {
++    .name          = TYPE_USB_AX88772,
++    .parent        = TYPE_USB_DEVICE,
++    .instance_size = sizeof(USBAsixState),
++    .class_init    = asix_class_init,
++};
++
++static void asix_register_types(void)
++{
++    type_register_static(&asix_info);
++}
++
++type_init(asix_register_types)
+diff --git a/hw/usb/Kconfig b/hw/usb/Kconfig
+index 5fbecd2..68e7787 100644
+--- a/hw/usb/Kconfig
++++ b/hw/usb/Kconfig
+@@ -105,6 +105,11 @@ config USB_SERIAL
+     default y
+     depends on USB
+ 
++config USB_ASIX
++    bool
++    default y
++    depends on USB
++
+ config USB_NETWORK
+     bool
+     default y
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index 1b4d150..92f2700 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -43,6 +43,7 @@ system_ss.add(when: 'CONFIG_USB_STORAGE_UAS', if_true: files('dev-uas.c'))
+ system_ss.add(when: 'CONFIG_USB_AUDIO', if_true: files('dev-audio.c'))
+ system_ss.add(when: 'CONFIG_USB_SERIAL', if_true: files('dev-serial.c'))
+ system_ss.add(when: 'CONFIG_USB_NETWORK', if_true: files('dev-network.c'))
++system_ss.add(when: 'CONFIG_USB_ASIX', if_true: files('dev-asix.c'))
+ if host_os != 'windows'
+   system_ss.add(when: 'CONFIG_USB_STORAGE_MTP', if_true: files('dev-mtp.c'))
+ endif
+diff --git a/hw/usb/trace-events b/hw/usb/trace-events
+index dd04f14..8bec9fe 100644
+--- a/hw/usb/trace-events
++++ b/hw/usb/trace-events
+@@ -248,6 +248,13 @@ usb_set_interface(int addr, int iface, int alt, int ret) "dev %d, interface %d,
+ usb_clear_device_feature(int addr, int feature, int ret) "dev %d, feature %d, ret %d"
+ usb_set_device_feature(int addr, int feature, int ret) "dev %d, feature %d, ret %d"
+ 
++# dev-asix.c
++usb_asix_control(int request, int value, int index, int length) "request 0x%04x value 0x%04x index 0x%04x length %d"
++usb_asix_unsupported(int request, int value, int index, int length) "request 0x%04x value 0x%04x index 0x%04x length %d"
++usb_asix_rx(int len) "frame %d bytes"
++usb_asix_tx(int len) "frame %d bytes"
++usb_asix_tx_bad(uint32_t hdr) "bad header 0x%08x"
++
+ # dev-hub.c
+ usb_hub_reset(int addr) "dev %d"
+ usb_hub_control(int addr, int request, int value, int index, int length) "dev %d, req 0x%x, value %d, index %d, length %d"

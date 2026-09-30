@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
 # usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--sd image|dir|none]
-#               [--persist] [--maintenance] [--display] [--realtime] [--user-exc] [--gdb] [--trace]
-#               [-- extra qemu args]
+#               [--eth ax88772|none] [--persist] [--maintenance] [--display] [--realtime] [--user-exc] [--gdb]
+#               [--trace] [-- extra qemu args]
 # HVM_OTG_DEVICE="<qemu -device spec>" (debug): plug that USB device into the USB-C port instead.
 set -euo pipefail
 
@@ -14,6 +14,7 @@ SOC=erista
 INI=
 NAND=
 SD=
+ETH=
 SNAPSHOT=on
 BUTTONS=0xC0
 REALTIME=
@@ -29,6 +30,7 @@ while [ $# -gt 0 ]; do
         --user-exc) EXO0_ARGS+=(--user-exc); shift ;;
         --nand) NAND="$2"; shift 2 ;;
         --sd) SD="$2"; shift 2 ;;
+        --eth) ETH="$2"; shift 2 ;;
         --persist) SNAPSHOT=off; shift ;;
         --maintenance) BUTTONS=0; shift ;;
         --realtime) REALTIME=1; shift ;;
@@ -36,7 +38,7 @@ while [ $# -gt 0 ]; do
                    echo "display: VNC on 127.0.0.1:${HVM_VNC:-5900}" >&2; shift ;;
         --gdb) GDB=(-s -S); shift ;;
         --trace) TRACE=(-plugin "$ROOT/build/plugins/libhvmtrace.so,out=$HVM/logs/hvmtrace-SOC.log${HVM_TRACE_ARGS:+,$HVM_TRACE_ARGS}"
-                        -trace 'enable=bm92t36_*'
+                        -trace 'enable=bm92t36_*' -trace 'enable=usb_asix_*'
                         -trace 'enable=usb_xhci_run' -trace 'enable=usb_xhci_stop' -trace 'enable=usb_xhci_reset'
                         -trace 'enable=usb_xhci_port_reset' -trace 'enable=usb_xhci_slot_*' -trace 'enable=usb_port_*'
                         -trace 'enable=usb_desc_device' -trace 'enable=usb_desc_config' -trace 'enable=usb_set_config'
@@ -60,6 +62,9 @@ if [ -z "$INI" ]; then
     [ -f "$ROOT/build/package2-ams.bin" ] && INI=ams
 fi
 PKG2="$ROOT/build/package2-$INI.bin"
+if [ -z "$ETH" ]; then                          # the adapter is plugged in once userland can use it
+    case "$INI" in ams|stock) ETH=ax88772 ;; *) ETH=none ;; esac
+fi
 [ -f "$PKG2" ] || { echo "missing $PKG2 (scripts/build.sh; ams/stock need HVM_FW)" >&2; exit 1; }
 
 ID="$HVM/identity/$SOC"
@@ -111,6 +116,15 @@ if [ -z "$REALTIME" ] && { [ "$INI" = ams ] || [ "$INI" = stock ]; }; then
     # and starves lower-priority processes. Costs MTTCG (all vCPUs on one host thread).
     EXTRA+=(-icount shift=0,sleep=off)
 fi
+# USB Ethernet adapter on the USB-C port through an OTG adapter: the PD controller reports a non-PD device, usb
+# turns the XUSB host on and eth drives the AX88772. Its MAC is the adapter's (fixed per SoC, locally administered).
+case "$ETH" in
+    none) ;;
+    ax88772) MAC=02:48:56:4d:00:0$([ "$SOC" = erista ] && echo 1 || echo 2)
+             EXTRA+=(-global driver=bm92t36,property=state,value=otg -netdev hubport,id=hvmnet,hubid=0
+                     -device "usb-ax88772,bus=usb-bus.2,port=1,netdev=hvmnet,mac=$MAC") ;;
+    *) echo "unknown --eth: $ETH" >&2; exit 2 ;;
+esac
 if [ -n "${HVM_OTG_DEVICE:-}" ]; then
     EXTRA+=(-global driver=bm92t36,property=state,value=otg -device "$HVM_OTG_DEVICE,bus=usb-bus.2,port=1")
 fi

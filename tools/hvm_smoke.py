@@ -28,6 +28,7 @@ EXTRA_ALLOWED = {'ams': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2),
 # interface, and nifm has none (neither the PCIe WLAN nor a USB Ethernet adapter is emulated). On stock, the fatal it
 # throws makes every sysmodule that throws one afterwards (pcv, vi, Bus, hid, FS, ...) Break: "fatal already thrown".
 ACCOUNT = '010000000000001e'
+ETH_DEFAULT = {'ams': 'ax88772', 'stock': 'ax88772'}          # = run.sh
 
 
 def expected_crashes(ini):
@@ -86,7 +87,8 @@ def monitor(sock_path, commands):
     return ANSI.sub('', out.decode('latin-1')).replace('\r', '')
 
 
-def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False):
+def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False, eth=None):
+    eth = eth or ETH_DEFAULT.get(ini, 'none')
     os.makedirs(os.path.join(HVM, 'run'), mode=0o700, exist_ok=True)
     os.makedirs(os.path.join(HVM, 'logs'), mode=0o700, exist_ok=True)
     sock = os.path.join(HVM, 'run', 'mon-%s.sock' % soc)
@@ -96,7 +98,7 @@ def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False)
     s_state_off, idle = kernel_offsets()
 
     with open(uart, 'wb') as out:
-        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + (['--persist'] if persist else []) + (['--maintenance'] if maintenance else []) + ['--trace', '--',
+        proc = subprocess.Popen([os.path.join(ROOT, 'scripts/run.sh'), '--soc', soc, '--ini', ini] + (['--nand', nand] if nand else []) + (['--persist'] if persist else []) + (['--maintenance'] if maintenance else []) + ['--eth', eth, '--trace', '--',
                                  '-monitor', 'unix:%s,server,nowait' % sock],
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     try:
@@ -142,7 +144,7 @@ def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False)
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
     ] + profile_checks(soc, ini, trace, log, maintenance, long) + writeback_checks(soc, ini, nand, persist) + \
-        usb_checks(ini, trace)
+        usb_checks(ini, trace, eth, long)
 
 
 def writeback_checks(soc, ini, nand, persist):
@@ -159,13 +161,29 @@ def writeback_checks(soc, ini, nand, persist):
              os.path.isdir(backups) and serial + '_PRODINFO.bin' in os.listdir(backups))]
 
 
-def usb_checks(ini, trace):
-    """USB-C port: the usb sysmodule drives the PD controller (bm92t36 trace events)."""
+def usb_checks(ini, trace, eth, long=False):
+    """USB-C port: the usb sysmodule drives the PD controller; on --long, with the adapter plugged in, the XUSB host
+    and eth drive the AX88772 (QEMU trace events)."""
     if ini not in ('ams', 'stock'):
         return []
-    resets = [a for name, a in trace['events'] if name == 'bm92t36_command' and a.endswith('0x0d0d')]
-    return [('usb: the PD controller completes one SYS_RESET (CMD_DONE through the CradleIrq alert, no retries)',
-             len(resets) == 1)]
+    events = trace['events']
+    resets = [a for name, a in events if name == 'bm92t36_command' and a.endswith('0x0d0d')]
+    checks = [('usb: the PD controller completes one SYS_RESET (CMD_DONE through the CradleIrq alert, no retries)',
+               len(resets) == 1)]
+    if eth == 'none' or not long:                # the host starts once psm answers usb's power request
+        return checks
+    controls = [a for name, a in events if name == 'usb_asix_control']
+    checks += [
+        ('late: usb: OTG plug -> XUSB host runs and enumerates the AX88772 (SET_CONFIGURATION 1)',
+         ('usb_xhci_run', '') in events and any(name == 'usb_set_config' and 'config 1, ret 0' in a
+                                                for name, a in events)),
+        ('late: eth drives the AX88772: PHY select, MAC read, receiver started, no unsupported request',
+         any(a.startswith('request 0x4022') for a in controls) and any(a.startswith('request 0xc013') for a in controls)
+         and any(re.match(r'request 0x4010 value 0x0[0-9a-f][89a-f][0-9a-f]', a) for a in controls)
+         and not any(name == 'usb_asix_unsupported' for name, _ in events)),
+    ]
+    return checks
+
 
 
 def user_smc_calls(trace):
@@ -324,6 +342,8 @@ def main():
     ap.add_argument('--maintenance', action='store_true', help='volume buttons held (run.sh --maintenance)')
     ap.add_argument('--long', action='store_true', help='ams/stock: wait %ds after boot2 and check the late '
                     'sysmodules' % LONG_SETTLE)
+    ap.add_argument('--eth', choices=['ax88772', 'none'], help='USB Ethernet adapter (run.sh --eth; default: '
+                    'ax88772 for ams/stock)')
     ap.add_argument('--timeout', type=int, default=600)
     args = ap.parse_args()
     os.umask(0o077)
@@ -334,7 +354,8 @@ def main():
     for nand in args.nand.split(',') if args.nand else [None]:
         for ini in inis:
             for soc in args.soc or ['erista', 'mariko']:
-                for name, ok in smoke(soc, ini, nand, args.timeout, args.persist, args.maintenance, args.long):
+                for name, ok in smoke(soc, ini, nand, args.timeout, args.persist, args.maintenance, args.long,
+                                      args.eth):
                     print('%-7s %-5s %-5s %-6s %s' % (soc, ini, nand or '', 'PASS' if ok else 'FAIL', name))
                     failed |= not ok
     sys.exit(1 if failed else 0)
