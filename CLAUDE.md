@@ -17,11 +17,15 @@ python3 -m unittest discover -s tools/tests   # unit tests (many skip without de
 python3 -m unittest discover -s tools/tests -k TestMkcal0              # one class
 python3 -m unittest discover -s tools/tests -k TestSd.test_<name>      # one test
 tools/hvm_smoke.py --soc erista --ini ams --nand dir                   # one smoke cell (scripts/smoke.sh = full matrix)
+tools/hvm_smoke.py --soc erista --ini ams --nand dir --long            # + late sysmodules' frontier (+5 min)
+tools/hvm_leakscan.py                                                  # identity secrets outside identity/ and sd/
 scripts/run.sh --soc mariko --ini stock --trace && tools/hvm_log.py --soc mariko
 ```
 
 VM data setup per SoC (`mkfuses`, `hvm_keys --derive-bis`, `mknand`, `mkcal0`, `mksd`) is in `README.md`.
 Atmosphère supports firmware ≤ 22.5.0 only.
+ams/stock run with `-icount` (guest clock follows instructions, single-threaded TCG; `run.sh --realtime` disables
+it): an ams/stock smoke cell takes ~5–7 min, `--long` ~12. Run one VM at a time.
 
 ## Architecture
 

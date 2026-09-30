@@ -1,28 +1,37 @@
-# Fase 3: estado (2026-09-28)
+# Fase 3: estado (2026-09-30, cerrada)
 
-Rama `fase3` sobre `main` (459d860). Hechos: M17 de13883, M18 43eea0d, M19 2b93016, fix de fuga b19adbd, M20 d332a00.
-Smoke (`tools/hvm_smoke.py`) verde en erista y mariko × {empty, core, ams, stock} × {image, dir} + ams/dir/--persist.
+Rama `fase3` sobre `main` (459d860). Hitos: M17 de13883, M18 43eea0d, M19 2b93016, fix de fuga b19adbd, M20 d332a00,
+fix del CAL0 c98b2ac, M21 05c34aa, M22 (este documento).
+Smoke (`tools/hvm_smoke.py`) verde en erista y mariko × {empty, core, ams, stock} × {image, dir}, más
+ams/dir/`--persist`, ams `--maintenance` y ams/stock `--long`; `tools/hvm_leakscan.py` limpio.
 
-## Frontera actual
-- ams: sin caídas; boot2 desde stratosphere.romfs lanza toda su lista (hasta memlet). `es` espera `ssl:s`
-  (ssl no llega a registrarlo); `nvservices` gira en bucle (GPU no emulada) y ocupa el core 3.
-- stock: boot2 oficial lanza su lista; cae `bluetooth` (010000000000000b, svc::Break).
+## Frontera al cerrar la fase
+- ams: boot2 desde stratosphere.romfs lanza su lista completa (hasta memlet); `--maintenance` lanza la de
+  mantenimiento. stock: el boot2 oficial pasa de omm y lanza la suya.
+- Con más tiempo (`--long`): bluetooth, btm y hid (`xcd:sys`) arrancan con la dirección BD del CAL0; omm registra
+  `spsm`, nifm `nifm:s`, ssl `ssl:s` y es sus servicios; audio arranca el firmware del ADSP (cpu 5).
+- account aborta la primera vez que crea `idgen:/context.bin`: necesita la MAC de al menos una interfaz de red y
+  nifm no tiene ninguna (`nifm:s` cmd 6 devuelve 0; wlan no encuentra su tarjeta PCIe y eth no tiene adaptador USB).
+  En stock, su `fatal:u` hace que cada sysmodule que lanza después su propio fatal (pcv, nvservices, vi, omm, Bus,
+  hid, ptm, bluetooth, btm, FS) haga svc::Break: «fatal ya lanzado». El smoke acepta solo ese orden.
+- El core 3 no queda nunca ocioso: nvservices/nvnflinger/vi (GPU no emulada), hid (lee el táctil emulado por I2C3
+  a ~160 Hz) y audio.
 - Pendiente de emulación: EMC queda a 19,2 MHz (estado de bootloader, no bloquea); los registros del PMIC
   (max77xpmic) no se reinician en un reset de QEMU.
 
-## Pendiente
-- M21 (ams): caracterizar la lista post-SD (qué registra cada módulo, dónde se para), investigar `ssl:s`,
-  comprobación `--maintenance` (boot2 elige la lista de mantenimiento), escaneo de fugas que excluya
-  `~/.horizonvm/sd/<soc>/` (ams_mitm guarda ahí BISKEYS.bin).
-- M22 (stock): caracterizar el boot2 oficial, investigar la caída de `bluetooth`, fijar `smoke --ini stock`,
-  cerrar la matriz final y hacer merge `--no-ff` de `fase3` a `main` (solo si el usuario lo pide).
+## Fase 4 (decidida, sin plan todavía)
+Red por Ethernet USB, para que nifm tenga interfaz (account) y haya red real: USB-PD (BM92T36, I2C1 0x18, hoy
+`dummyi2c`) y VBUS OTG (BQ24193, 0x6B) para que `usb` active el host XUSB (`tegra.xusb` es el xHCI de QEMU; sus
+regiones no coinciden del todo con las del X1), un modelo de dispositivo USB RTL8153 (eth trae el parche
+`rtl8153b`) y un backend de red de QEMU. La WLAN (PCIe de Tegra210 + dongle BCM4356 FullMAC) se descartó por coste.
 
 ## Herramientas de depuración
 - `HVM_TRACE_ARGS=watch_pid=N,watch=off1:off2` + `run.sh --trace`: vuelca x0–x30 del proceso N en offsets de
   código (`pc & 0x1FFFFF`). Los PID son deterministas. Nunca sobre procesos con claves (spl, FS…).
 - Las peticiones a `sm` llevan `bt=` (cadena de retorno). Binarios de Nintendo: descomprimir NSO/KIP con lz4/BLZ
-  en `~/.horizonvm/tmp/re` y abrir en IDA; nunca en el repo.
+  en `~/.horizonvm/tmp/re` y abrir en IDA (como ELF aarch64 de un solo segmento); nunca en el repo.
 - GDB sobre exosphere: `set print frame-arguments none` (los argumentos de sus funciones crypto son claves).
+- `tools/hvm_leakscan.py` tras cualquier ejecución: busca los secretos de `identity/` fuera de su sitio.
 
 ## Normas
 No parchear Atmosphère; parches neutros de tegra_qemu solo si hace falta; un commit `Mx:` por hito verificado,
@@ -37,8 +46,7 @@ Nintendo nunca entra en el repo; decisiones de diseño, consultar al usuario.
   CLK_M), VDD_CPU a 0,95 V (MAX77621 en Erista / MAX77812 en Mariko) y el LDO2 de la SD apagado. Parche
   `patches/tegra_qemu/0003-bootloader-state.patch` (propiedades `tegra.car.spare-reg0` y
   `max77xpmic.boot-regs`, fijadas por `run.sh` por SoC). `mkfuses.py` no cambia.
-- El smoke de `ams`/`stock` exige WFI solo en los cores 0–2 (el 3 lo ocupa nvservices) y admite caídas conocidas
-  por program id (`EXPECTED_CRASHES`).
+- El smoke de `ams`/`stock` exige WFI solo en los cores 0–2 (el 3 no queda ocioso, ver frontera).
 - Fuga corregida (b19adbd): la SVC CallSecureMonitor (0x7F) ahora sigue la misma redacción que las SMC.
 - M20, según prodinfo_gen (CaramelDunes):
   - bloques opcionales sin CRC (ausentes);
@@ -50,10 +58,28 @@ Nintendo nunca entra en el repo; decisiones de diseño, consultar al usuario.
   en `prod.keys` (el usuario ya las añadió). Sin ella, el exosphere debug hace assert en el GCM y reinicia por WDT.
 - M20: `erpt` caía por saves de settings con PlatformRegion=0, creados con el CAL0 en blanco. Se vació
   `SYSTEM/save` de Erista (con permiso del usuario) y se regeneró con `ams --nand dir --persist`.
+- Fix del CAL0 (M20): `WlanMacAddress` y `BdAddress` son 6 bytes + CRC16 + 8 de relleno (prodinfo_gen), no un
+  bloque hasta el campo siguiente. settings respondía 2105-0582 (CRC) y bluetooth abortaba: era la «caída de
+  bluetooth» de stock. PRODINFO e imágenes regenerados en los dos SoC.
+- M21: con el CAL0 arreglado, hid, vsync y audio saturan en tiempo real el core 3 emulado y en ams boot2 se
+  quedaba en glue (Loader esperando `csrng` de spl, que no recibía CPU). Decisión del usuario: `run.sh` pasa
+  `-icount shift=0,sleep=off` en ams/stock (el reloj del guest avanza por instrucciones; `--realtime` lo quita).
+  Coste: TCG de un solo hilo, ~4,5 min hasta que sale boot2 con traza; timeout por defecto del smoke, 600 s.
+- M21: `ssl:s` no estaba bloqueado: ssl lo registra con más tiempo y es arranca.
+- M21: el MMIO del ADSP (cpu 5: APE, su región privada y su ARAM) se clasifica por CPU, no por dirección; APE,
+  HDA y ADSP solo se permiten en ams/stock.
+- M21: smoke `--maintenance` (sin friends/bcat/eupld; npns se lanza en los dos modos desde 7.0.0) y `--long`
+  (+300 s, frontera tardía); las caídas esperadas dependen del orden (account primero; en stock, la cascada de su
+  fatal).
+- M21: escaneo de fugas como herramienta, `tools/hvm_leakscan.py` (decisión del usuario).
+- Datos locales (con permiso del usuario): se descartó el overlay de Erista del 28/09 (sesión cortada con
+  escrituras pendientes) y se regeneró otra vez `SYSTEM/save` de Erista; el save idgen había quedado a medias por
+  un corte de QEMU (2002-4364). La copia anterior está en `~/.horizonvm/tmp/save-erista-20260929`.
 - Decisiones del usuario:
   - lista blanca del CAL0: tal cual se propuso;
   - serial: retail realista (`XAW1`/`XKW1` + dígito de control);
-  - `settings`: investigar en vez de fabricar saves.
+  - `settings`: investigar en vez de fabricar saves;
+  - red: cerrar F3 con la frontera de account y abordar Ethernet USB en la fase 4.
 
 ## Plan aprobado (original, sin modificar)
 
