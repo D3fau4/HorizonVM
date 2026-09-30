@@ -58,6 +58,9 @@ FIELDS = [
 ]
 END = 0x4350
 BLOCKS = {name: (off, nxt - off) for (off, name), nxt in zip(FIELDS, [f[0] for f in FIELDS[1:]] + [END])}
+# Except the MAC addresses: 6 bytes + CRC16, then 8 bytes of zero padding (prodinfo_gen cal_blocks.h; settings
+# checks the CRC at +6 and answers set:cal GetBluetoothBdAddress/GetWirelessLanMacAddress with 2105-0582 otherwise).
+BLOCKS.update(WlanMacAddress=(0x210, 8), BdAddress=(0x220, 8))
 # Raw data protected by a separate SHA-256 block instead of a CRC, and unused space.
 SHA_DATA = {'SslCertificate': 'SslCertificateHash', 'RandomNumber': 'RandomNumberHash',
             'GameCardCertificate': 'GameCardCertificateHash'}
