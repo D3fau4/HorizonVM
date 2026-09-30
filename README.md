@@ -35,12 +35,16 @@ scripts/run.sh --persist             # keep eMMC writes (default: snapshot, the 
 scripts/run.sh --nand dir            # eMMC served live from ~/.horizonvm/nand/<soc>/dir over NBD (tools/hvm_nbd.py)
 scripts/run.sh --nand dir --persist  # ... and write the guest's changes back into those folders when QEMU exits
 scripts/run.sh --sd dir              # SD card from ~/.horizonvm/sd/<soc>/dir (default: follows --nand for ams/stock)
+scripts/run.sh --maintenance         # volume buttons held: boot2 launches its maintenance list
+scripts/run.sh --realtime            # ams/stock run with -icount (guest clock = instructions) unless this
 tools/hvm_nbd.py sync --soc erista --to /tmp/snap   # snapshot folders + pending writes (safe while running)
 tools/hvm_nbd.py sync --disk sd --soc erista          # the same for the SD card
 scripts/run.sh --soc erista --gdb    # then: gdb-multiarch -x gdb/horizonvm.gdb -ex hvm-trace
 scripts/run.sh --soc erista --trace  # + hvmtrace plugin: SMC/MMIO log (secrets redacted at the source)
 tools/hvm_log.py --soc erista        # summarize/check SMC, MMIO per device, exceptions
 scripts/smoke.sh                     # headless boot check, erista + mariko x every built INI1 profile
+tools/hvm_smoke.py --ini ams --long  # ... and the late sysmodules' frontier (+5 min); also --maintenance
+tools/hvm_leakscan.py                # look for the VM identities' secrets outside identity/ and the SD
 ```
 
 Raw logs live in `~/.horizonvm/logs` (private); share only `hvm_log.py` summaries.

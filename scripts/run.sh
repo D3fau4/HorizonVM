@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Boot HorizonVM: CCPLEX core 0 starts at EL3 in exosphere, which hands off to Mesosphere (no fusee/BPMP).
 # usage: run.sh [--soc erista|mariko] [--ini empty|core|ams|stock] [--nand image|dir|none] [--sd image|dir|none]
-#               [--persist] [--maintenance] [--display] [--user-exc] [--gdb] [--trace] [-- extra qemu args]
+#               [--persist] [--maintenance] [--display] [--realtime] [--user-exc] [--gdb] [--trace]
+#               [-- extra qemu args]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +15,7 @@ NAND=
 SD=
 SNAPSHOT=on
 BUTTONS=0xC0
+REALTIME=
 DISPLAY_ARGS=(-display none)
 EXO0_ARGS=()
 GDB=()
@@ -28,6 +30,7 @@ while [ $# -gt 0 ]; do
         --sd) SD="$2"; shift 2 ;;
         --persist) SNAPSHOT=off; shift ;;
         --maintenance) BUTTONS=0; shift ;;
+        --realtime) REALTIME=1; shift ;;
         --display) DISPLAY_ARGS=(-display none -vnc "127.0.0.1:$((${HVM_VNC:-5900} - 5900))")
                    echo "display: VNC on 127.0.0.1:${HVM_VNC:-5900}" >&2; shift ;;
         --gdb) GDB=(-s -S); shift ;;
@@ -96,6 +99,12 @@ if [ -z "$SD" ]; then                           # the card follows the eMMC back
 fi
 attach emmc 3 "$NAND" "$IMG"                    # SDMMC4 (tegrax1.c: sd index 3)
 attach sd 0 "$SD" "$SDIMG"                      # SDMMC1
+if [ -z "$REALTIME" ] && { [ "$INI" = ams ] || [ "$INI" = stock ]; }; then
+    # Guest time follows executed instructions (1 ns each), not the host clock: with boot2's sysmodules up, their
+    # real-time periodic work (hid polling the touch panel, vsync, audio) otherwise saturates the emulated core 3
+    # and starves lower-priority processes. Costs MTTCG (all vCPUs on one host thread).
+    EXTRA+=(-icount shift=0,sleep=off)
+fi
 if [ "$SOC" = mariko ]; then
     # exosphere copies the Mariko fatal program from 0x80020000 into TZRAM (secmon_boot_setup.cpp LoadMarikoProgram).
     EXTRA+=(-device "loader,addr=0x80020000,force-raw=on,file=$AMS/exosphere/mariko_fatal/out/$OUT/mariko_fatal.bin")

@@ -11,9 +11,11 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import hvm_keys  # noqa: E402
+import hvm_leakscan  # noqa: E402
 import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
 import hvm_nbd   # noqa: E402
+import hvm_smoke  # noqa: E402
 import mkcal0   # noqa: E402
 import mknand   # noqa: E402
 import mksd     # noqa: E402
@@ -758,6 +760,39 @@ class TestMkcal0(unittest.TestCase):
                 self.assertNotEqual(cal[off:off + size - 2], ref[off:off + size - 2], name)
 
 
+class TestLeakScan(unittest.TestCase):
+    def test_scan(self):
+        d = tempfile.mkdtemp()
+        try:
+            hvm, repo = os.path.join(d, 'hvm'), os.path.join(d, 'repo')
+            for sub in ('identity/erista', 'logs', 'sd/erista/dir', 'nand/erista'):
+                os.makedirs(os.path.join(hvm, sub))
+            os.makedirs(repo)
+            subprocess.run(['git', 'init', '-q', repo], check=True)
+            with open(os.path.join(repo, '.gitignore'), 'w') as f:
+                f.write('*.keys\n')
+            bis = bytes(range(0x40, 0xC0))
+            files = {'identity/erista/bis.bin': bis, 'sd/erista/dir/X_BISKEYS.bin': bis,
+                     'nand/erista/emmc.img': bis, 'logs/clean.log': b'x0=0x1234\n'}
+            for rel, data in files.items():
+                with open(os.path.join(hvm, rel), 'wb') as f:
+                    f.write(data)
+            self.assertEqual(hvm_leakscan.scan(hvm, repo), [])
+            leaks = {'logs/hex.log': b'key=' + bis[16:32].hex().upper().encode() + b'\n',
+                     'logs/reg.log': b'x2=0x%x\n' % int.from_bytes(bis[40:48], 'little'),
+                     'logs/raw.bin': b'\x00' + bis[64:80],
+                     'logs/copy_BISKEYS.bin': b''}
+            for rel, data in leaks.items():
+                with open(os.path.join(hvm, rel), 'wb') as f:
+                    f.write(data)
+            with open(os.path.join(repo, 'prod.keys'), 'w') as f:
+                f.write('')
+            found = {os.path.relpath(p, d) for p, _ in hvm_leakscan.scan(hvm, repo)}
+            self.assertEqual(found, {'hvm/' + k for k in leaks} | {'repo/prod.keys'})
+        finally:
+            shutil.rmtree(d)
+
+
 def tipc(cmd, name=b'', pid=False):
     """A tipc request as it sits in TLS (sm_msg dump)."""
     words = [16 + cmd, (1 << 31) if pid else 0]
@@ -861,6 +896,11 @@ class TestHvmLog(unittest.TestCase):
                      "Abort: 'R_SUCCEEDED(rc)' in Main, process=0x02, thread=5 (main)\n"):
             self.assertTrue(self.analyze(self.GOOD, uart=uart)['violations'], uart)
 
+    def test_adsp_mmio_by_cpu(self):
+        adsp = 'mmio cpu=5 pc=0x80521b48 W addr=0xc02770 size=4 val=0x1\nmmio cpu=5 pc=0x0 R addr=0x702ec040 size=4 val=0x0\n'
+        self.assertIn('MMIO to adsp (not in allowlist)', self.analyze(self.GOOD + adsp)['violations'])
+        self.assertEqual(self.analyze(self.GOOD + adsp)['mmio']['adsp']['R'], 1)
+
     def test_expected_crash(self):
         uart = self.UART + 'erpt: svc::Break(0) was called, pid=3\nBreak() called. 010000000000002b\n'
         self.assertIn('UART: Break() called 010000000000002b', self.analyze(self.GOOD, uart=uart)['violations'])
@@ -872,6 +912,23 @@ class TestHvmLog(unittest.TestCase):
                     f.write(text)
             r = hvm_log.analyze(*paths, expected_crashes={'010000000000002b'})
             self.assertEqual((r['violations'], r['crashes']), ([], {'010000000000002b': 'Break() called'}))
+        finally:
+            shutil.rmtree(d)
+
+    def test_account_frontier_and_fatal_cascade(self):
+        account, pcv, fs = hvm_smoke.ACCOUNT, '010000000000001a', '0100000000000000'
+        cascade = ''.join('Break() called. %s\n' % p for p in (account, pcv, fs))
+        d = tempfile.mkdtemp()
+        try:
+            paths = [os.path.join(d, n) for n in 'tqu']
+            for uart, ini, ok in ((cascade, 'stock', True), (cascade, 'ams', False),
+                                  ('Break() called. %s\n' % account, 'ams', True),
+                                  ('Break() called. %s\nBreak() called. %s\n' % (pcv, account), 'stock', False)):
+                for path, text in zip(paths, (self.GOOD, self.QEMU, self.UART + uart)):
+                    with open(path, 'w') as f:
+                        f.write(text)
+                r = hvm_log.analyze(*paths, expected_crashes=hvm_smoke.expected_crashes(ini))
+                self.assertEqual(r['violations'] == [], ok, (ini, uart, r['violations']))
         finally:
             shutil.rmtree(d)
 

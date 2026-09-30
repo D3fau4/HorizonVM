@@ -27,8 +27,11 @@ DEVICES = [
     (0x700E3000, 0x100, 'mipi_cal'), (0x700F0000, 0x10000, 'sysctr0'), (0x70100000, 0x10000, 'sysctr1'), (0x70412000, 0x2000, 'se2'),
     (0x70420000, 0x10000, 'pka1'), (0x01000000, 0x4000, 'pcie'), (0x58000000, 0x1000000, 'gpu_bar1'),
     (0x60021000, 0x1000, 'apb_dma_ch'), (0x7009F000, 0x1000, 'xusb_padctl'), (0x700E2000, 0x1000, 'soc_therm'),
-    (0x70110000, 0x400, 'cl_dvfs'),
+    (0x70110000, 0x400, 'cl_dvfs'), (0x702C0000, 0x40000, 'ape'), (0x70030000, 0x10000, 'hda'),
 ]
+# The APE's Cortex-A9 (tegrax1.c: "APE is cpu5") runs the ADSP firmware audio loads, in its own address space
+# (ARAM, A9 private region and L2 at 0xC00000, an APE mirror): its accesses are classified by CPU, not address.
+ADSP_CPU = 5
 
 # Devices exosphere, the NX kernel and the INI1 processes are expected to touch (and why).
 ALLOWED = {
@@ -48,7 +51,8 @@ ALLOWED_BOOT_HW = {'i2c': 'boot: PMIC/charger/fuel gauge', 'gpio': 'boot: GPIO c
 # What the boot2 sysmodules drive once pcv is up (clkrst/regulators answer).
 ALLOWED_BOOT2 = {'cl_dvfs': 'pcv: CPU DFLL', 'soc_therm': 'pcv/ptm: thermal', 'pcie': 'pcie', 'xusb_padctl': 'usb',
                  'gpu': 'nvservices', 'gpu_bar1': 'nvservices', 'spi': 'hid: touch screen',
-                 'apb_dma': 'Bus: UART/I2C/SPI DMA', 'apb_dma_ch': 'Bus: UART/I2C/SPI DMA'}
+                 'apb_dma': 'Bus: UART/I2C/SPI DMA', 'apb_dma_ch': 'Bus: UART/I2C/SPI DMA',
+                 'ape': 'audio: AHUB/ADMA', 'hda': 'audio: HDA', 'adsp': 'audio: ADSP firmware (cpu 5)'}
 
 # exosphere dispatches on the smc immediate (secmon_smc_handler.cpp): 1 = kernel table, 0 = user table.
 SMC_NAMES = {
@@ -162,7 +166,8 @@ def regs_of(rest):
 
 
 def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, expected_crashes=()):
-    """expected_crashes: program ids (hex) whose crash is a known frontier; their EL0 faults are not violations."""
+    """expected_crashes: program ids (hex) whose crash is a known frontier, or a function of the crashes in UART order
+    returning them; their EL0 faults are not violations."""
     smc, smc_ret, smc_el, mmio = collections.Counter(), collections.Counter(), collections.Counter(), {}
     user_smc, user_smc_cores, leaks = [], collections.Counter(), []
     svc = collections.Counter()
@@ -244,9 +249,9 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, exp
                 continue
             m = MMIO_RE.match(line)
             if m:
-                _, rw, addr, val = m.groups()
+                cpu, rw, addr, val = m.groups()
                 addr = int(addr, 16)
-                dev = device_of(addr)
+                dev = 'adsp' if int(cpu) == ADSP_CPU else device_of(addr)
                 mmio.setdefault(dev, collections.Counter())[rw] += 1
                 if any(a <= addr < b for a, b in SECRET_RANGES) and val != '<redacted>':
                     leaks.append('SE/PKA value not redacted at %#x' % addr)
@@ -266,6 +271,8 @@ def analyze(trace_path, qemu_log_path=None, uart_path=None, allowed=ALLOWED, exp
         procs = {int(p): n for p, n in PROC_RE.findall(uart)}
         uart_bad = sorted({m.group(0) for m in UART_BAD.finditer(uart)})
         crashes = {prog: kind for kind, prog in CRASH_RE.findall(uart)}
+    if callable(expected_crashes):
+        expected_crashes = expected_crashes(list(crashes.items()))
     expected = set(expected_crashes) & set(crashes)
 
     violations = []
