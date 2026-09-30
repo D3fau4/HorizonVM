@@ -4,6 +4,7 @@
 #               [--eth ax88772|none] [--persist] [--maintenance] [--display] [--realtime] [--user-exc] [--gdb]
 #               [--trace] [-- extra qemu args]
 # HVM_OTG_DEVICE="<qemu -device spec>" (debug): plug that USB device into the USB-C port instead.
+# HVM_NET_PCAP=<file>: also capture the adapter's traffic (hvm_net --pcap).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,7 +122,16 @@ fi
 case "$ETH" in
     none) ;;
     ax88772) MAC=02:48:56:4d:00:0$([ "$SOC" = erista ] && echo 1 || echo 2)
-             EXTRA+=(-global driver=bm92t36,property=state,value=otg -netdev hubport,id=hvmnet,hubid=0
+             # hvm_net answers for the rest of the (isolated) network; it exits when QEMU disconnects.
+             NETSOCK="$HVM/run/net-$SOC.sock"
+             mkdir -p "$HVM/run"
+             rm -f "$NETSOCK"
+             python3 "$ROOT/tools/hvm_net.py" serve --soc "$SOC" --socket "$NETSOCK" \
+                 ${HVM_NET_PCAP:+--pcap "$HVM_NET_PCAP"} &
+             for _ in $(seq 1 240); do [ -S "$NETSOCK" ] && break; sleep 0.25; done
+             [ -S "$NETSOCK" ] || { echo "hvm_net did not start" >&2; exit 1; }
+             EXTRA+=(-global driver=bm92t36,property=state,value=otg
+                     -netdev "stream,id=hvmnet,server=off,addr.type=unix,addr.path=$NETSOCK"
                      -device "usb-ax88772,bus=usb-bus.2,port=1,netdev=hvmnet,mac=$MAC") ;;
     *) echo "unknown --eth: $ETH" >&2; exit 2 ;;
 esac

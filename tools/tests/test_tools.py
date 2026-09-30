@@ -15,6 +15,7 @@ import hvm_leakscan  # noqa: E402
 import hvm_log  # noqa: E402
 import hvm_nand  # noqa: E402
 import hvm_nbd   # noqa: E402
+import hvm_net   # noqa: E402
 import hvm_smoke  # noqa: E402
 import mkcal0   # noqa: E402
 import mknand   # noqa: E402
@@ -943,6 +944,133 @@ class TestHvmLog(unittest.TestCase):
         self.assertEqual(r['violations'], [])
         self.assertEqual(r['events'], [('bm92t36_command', 'command 0x0d0d'), ('usb_xhci_run', '')])
         self.assertEqual(r['exc'][('FP access', 'EL0', 'EL1')], 1)
+
+
+class TestHvmNet(unittest.TestCase):
+    VM_MAC = bytes.fromhex('0248564d0001')
+
+    def setUp(self):
+        self.events = []
+        self.stack = hvm_net.Stack(self.events.append)
+
+    def udp_frame(self, src, sport, dst, dport, payload, dst_mac=b'\xff' * 6):
+        ip = hvm_net.udp(hvm_net.ipaddress.IPv4Address(src), sport, hvm_net.ipaddress.IPv4Address(dst), dport,
+                         payload)
+        return hvm_net.ether(dst_mac, self.VM_MAC, hvm_net.ETH_IP, ip)
+
+    def dhcp(self, kind, requested=None):
+        msg = struct.pack('!BBBB4sHH4s4s4s4s16s64s128s', 1, 1, 6, 0, b'\x12\x34\x56\x78', 0, 0x8000, b'\0' * 4,
+                          b'\0' * 4, b'\0' * 4, b'\0' * 4, self.VM_MAC.ljust(16, b'\0'), b'', b'')
+        msg += hvm_net.DHCP_MAGIC + bytes([53, 1, kind, 55, 4, 1, 3, 6, 26])
+        if requested:
+            msg += bytes([50, 4]) + hvm_net.ipaddress.IPv4Address(requested).packed
+        replies = self.stack.handle(self.udp_frame('0.0.0.0', 68, '255.255.255.255', 67, msg + b'\xff'))
+        self.assertEqual(len(replies), 1)
+        reply = replies[0]
+        ip = reply[14:]
+        self.assertEqual(hvm_net.checksum(ip[:20]), 0)                 # IPv4 header checksum
+        udp = ip[20:]
+        pseudo = ip[12:20] + struct.pack('!BBH', 0, 17, len(udp))
+        self.assertEqual(hvm_net.checksum(pseudo + udp), 0)            # UDP checksum
+        body = udp[8:]
+        opts, i = {}, 240
+        while body[i] != 255:
+            opts[body[i]] = body[i + 2:i + 2 + body[i + 1]]
+            i += 2 + body[i + 1]
+        return body, opts
+
+    def test_dhcp_handshake(self):
+        body, opts = self.dhcp(hvm_net.DHCP_DISCOVER)
+        self.assertEqual((opts[53][0], body[16:20]), (hvm_net.DHCP_OFFER, bytes([10, 0, 2, 15])))
+        self.assertEqual((opts[1], opts[3], opts[6], opts[26]), (bytes([255, 255, 255, 0]), bytes([10, 0, 2, 2]),
+                                                                  bytes([10, 0, 2, 3]), b'\x05\xdc'))
+        body, opts = self.dhcp(hvm_net.DHCP_REQUEST, '10.0.2.15')
+        self.assertEqual((opts[53][0], body[16:20], body[4:8]), (hvm_net.DHCP_ACK, bytes([10, 0, 2, 15]),
+                                                                  b'\x12\x34\x56\x78'))
+        _, opts = self.dhcp(hvm_net.DHCP_REQUEST, '10.0.2.99')
+        self.assertEqual(opts[53][0], hvm_net.DHCP_NAK)
+        self.assertIn('dhcp ACK 10.0.2.15 to 02:48:56:4d:00:01', self.events)
+
+    def arp(self, target):
+        req = struct.pack('!HHBBH', 1, 0x0800, 6, 4, 1) + self.VM_MAC + bytes([10, 0, 2, 15]) + b'\0' * 6 + \
+            hvm_net.ipaddress.IPv4Address(target).packed
+        return self.stack.handle(hvm_net.ether(b'\xff' * 6, self.VM_MAC, hvm_net.ETH_ARP, req))
+
+    def test_arp(self):
+        [reply] = self.arp('10.0.2.2')
+        self.assertEqual((reply[:6], reply[12:14], reply[20:22], reply[22:28], reply[28:32]),
+                         (self.VM_MAC, b'\x08\x06', b'\x00\x02', hvm_net.GATEWAY_MAC, bytes([10, 0, 2, 2])))
+        self.assertEqual(self.arp('10.0.2.15'), [])                   # probe / gratuitous ARP for its own lease
+        self.assertEqual(self.arp('8.8.8.8'), [])
+
+    def test_ping(self):
+        echo = struct.pack('!BBHHH', 8, 0, 0, 1, 1) + b'abc'
+        echo = echo[:2] + struct.pack('!H', hvm_net.checksum(echo)) + echo[4:]
+        ip = hvm_net.ipv4(hvm_net.ipaddress.IPv4Address('10.0.2.15'), hvm_net.GATEWAY, 1, echo)
+        [reply] = self.stack.handle(hvm_net.ether(hvm_net.GATEWAY_MAC, self.VM_MAC, hvm_net.ETH_IP, ip))
+        icmp = reply[34:]
+        self.assertEqual((icmp[0], hvm_net.checksum(icmp), icmp[4:]), (0, 0, echo[4:]))
+
+    def test_dns_nxdomain(self):
+        q = struct.pack('!HHHHHH', 0xbeef, 0x0100, 1, 0, 0, 0) + b'\x05ctest\x03cdn\x08nintendo\x03net\x00' + \
+            struct.pack('!HH', 1, 1)
+        [reply] = self.stack.handle(self.udp_frame('10.0.2.15', 40000, '10.0.2.3', 53, q, hvm_net.GATEWAY_MAC))
+        dns = reply[42:]
+        self.assertEqual(struct.unpack('!HHHH', dns[:8]), (0xbeef, 0x8183, 1, 0))
+        self.assertEqual(dns[12:], q[12:])
+        self.assertEqual(struct.unpack('!HH', reply[34:38]), (53, 40000))
+        self.assertIn('dns A ctest.cdn.nintendo.net -> NXDOMAIN', self.events)
+
+    def test_tcp_reset_and_udp_unreachable(self):
+        src, dst = hvm_net.ipaddress.IPv4Address('10.0.2.15'), hvm_net.ipaddress.IPv4Address('203.0.113.7')
+        syn = struct.pack('!HHIIHHHH', 50000, 443, 1000, 0, (5 << 12) | 0x02, 65535, 0, 0)
+        [reply] = self.stack.handle(hvm_net.ether(hvm_net.GATEWAY_MAC, self.VM_MAC, hvm_net.ETH_IP,
+                                                  hvm_net.ipv4(src, dst, 6, syn)))
+        tcp = reply[34:]
+        self.assertEqual(struct.unpack('!HHII', tcp[:12]) + (tcp[13],), (443, 50000, 0, 1001, 0x14))
+        self.assertEqual(hvm_net.l4_checksum(dst, src, 6, tcp), 0)
+        [reply] = self.stack.handle(self.udp_frame('10.0.2.15', 123, '203.0.113.7', 123, b'x' * 48,
+                                                   hvm_net.GATEWAY_MAC))
+        self.assertEqual(reply[34:36], b'\x03\x03')                  # ICMP port unreachable
+
+    def test_malformed_and_other_ethertypes(self):
+        for frame in (b'', b'\x00' * 13, hvm_net.ether(b'\xff' * 6, self.VM_MAC, 0x86DD, b'\0' * 40),
+                      hvm_net.ether(b'\xff' * 6, self.VM_MAC, hvm_net.ETH_IP, b'\x45\x00'),
+                      self.udp_frame('0.0.0.0', 68, '255.255.255.255', 67, b'\x01' * 10)):
+            self.assertEqual(self.stack.handle(frame), [])
+        self.assertEqual(self.stack.counts.get('ethertype 0x86dd'), 1)
+
+    def test_stream_framing_without_inet_sockets(self):
+        real = socket.socket
+
+        def guarded(family=socket.AF_UNIX, *a, **k):
+            if family != socket.AF_UNIX:
+                raise AssertionError('hvm_net opened a non-unix socket')
+            return real(family, *a, **k)
+        a, b = socket.socketpair()
+        try:
+            hvm_net.socket.socket = guarded
+            req = struct.pack('!HHBBH', 1, 0x0800, 6, 4, 1) + self.VM_MAC + bytes([10, 0, 2, 15]) + b'\0' * 6 + \
+                bytes([10, 0, 2, 3])
+            frame = hvm_net.ether(b'\xff' * 6, self.VM_MAC, hvm_net.ETH_ARP, req)
+            a.sendall(struct.pack('!I', len(frame)) + frame[:10])
+            a.sendall(frame[10:])
+            a.shutdown(socket.SHUT_WR)
+            hvm_net.serve_connection(b, self.stack)
+            data = a.recv(4096)
+            self.assertEqual(struct.unpack('!I', data[:4])[0], len(data) - 4)
+            self.assertEqual(data[4 + 22:4 + 28], hvm_net.GATEWAY_MAC)
+            d = tempfile.mkdtemp()
+            try:
+                sock = os.path.join(d, 's')
+                with self.assertRaises(SystemExit):
+                    hvm_net.serve(sock, os.path.join(d, 'log'), accept_timeout=0.1)
+            finally:
+                shutil.rmtree(d)
+        finally:
+            hvm_net.socket.socket = real
+            a.close()
+            b.close()
 
 
 if __name__ == '__main__':

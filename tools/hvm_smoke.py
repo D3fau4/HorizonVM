@@ -29,6 +29,7 @@ EXTRA_ALLOWED = {'ams': dict(hvm_log.ALLOWED_BOOT_HW, **hvm_log.ALLOWED_BOOT2),
 # throws makes every sysmodule that throws one afterwards (pcv, vi, Bus, hid, FS, ...) Break: "fatal already thrown".
 ACCOUNT = '010000000000001e'
 ETH_DEFAULT = {'ams': 'ax88772', 'stock': 'ax88772'}          # = run.sh
+ADAPTER_MAC = {'erista': '02:48:56:4d:00:01', 'mariko': '02:48:56:4d:00:02'}
 
 
 def expected_crashes(ini):
@@ -144,7 +145,7 @@ def smoke(soc, ini, nand, timeout, persist=False, maintenance=False, long=False,
         ('trace: 3 PSCI CpuOn via smc #1', trace['smc'][(1, 0xC4000003)] == 3),
         ('trace: SMC/MMIO/exceptions allowlisted, secrets redacted, no crash on UART', not trace['violations']),
     ] + profile_checks(soc, ini, trace, log, maintenance, long) + writeback_checks(soc, ini, nand, persist) + \
-        usb_checks(ini, trace, eth, long)
+        usb_checks(soc, ini, trace, eth, long)
 
 
 def writeback_checks(soc, ini, nand, persist):
@@ -161,9 +162,9 @@ def writeback_checks(soc, ini, nand, persist):
              os.path.isdir(backups) and serial + '_PRODINFO.bin' in os.listdir(backups))]
 
 
-def usb_checks(ini, trace, eth, long=False):
+def usb_checks(soc, ini, trace, eth, long=False):
     """USB-C port: the usb sysmodule drives the PD controller; on --long, with the adapter plugged in, the XUSB host
-    and eth drive the AX88772 (QEMU trace events)."""
+    and eth drive the AX88772 (QEMU trace events) and nifm leases an address from hvm_net."""
     if ini not in ('ams', 'stock'):
         return []
     events = trace['events']
@@ -173,6 +174,7 @@ def usb_checks(ini, trace, eth, long=False):
     if eth == 'none' or not long:                # the host starts once psm answers usb's power request
         return checks
     controls = [a for name, a in events if name == 'usb_asix_control']
+    net = net_log(soc)
     checks += [
         ('late: usb: OTG plug -> XUSB host runs and enumerates the AX88772 (SET_CONFIGURATION 1)',
          ('usb_xhci_run', '') in events and any(name == 'usb_set_config' and 'config 1, ret 0' in a
@@ -181,9 +183,20 @@ def usb_checks(ini, trace, eth, long=False):
          any(a.startswith('request 0x4022') for a in controls) and any(a.startswith('request 0xc013') for a in controls)
          and any(re.match(r'request 0x4010 value 0x0[0-9a-f][89a-f][0-9a-f]', a) for a in controls)
          and not any(name == 'usb_asix_unsupported' for name, _ in events)),
+        ('late: nifm leases 10.0.2.15 from hvm_net (DHCP ACK to the adapter MAC)',
+         'dhcp ACK 10.0.2.15 to %s' % ADAPTER_MAC[soc] in net),
+        ('late: nifm connection test: ctest.cdn.nintendo.net answered NXDOMAIN (nothing leaves the host)',
+         'dns A ctest.cdn.nintendo.net -> NXDOMAIN' in net),
     ]
     return checks
 
+
+def net_log(soc):
+    path = os.path.join(HVM, 'logs', 'net-%s.log' % soc)
+    if not os.path.exists(path):
+        return ''
+    with open(path) as f:
+        return f.read()
 
 
 def user_smc_calls(trace):
